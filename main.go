@@ -60,10 +60,8 @@ func main() {
 		if !autorun {
 			if outFilename == "" {
 				outFilename = basename + ".nn.go"
-				outfile, err = os.Create(outFilename)
-			} else {
-				outfile, err = os.Create(outFilename)
 			}
+			outfile, err = os.Create(outFilename)
 			dieErr(err, "nex")
 			defer outfile.Close()
 		}
@@ -78,10 +76,18 @@ func main() {
 		dieErr(err, "nex")
 		defer outfile.Close()
 	}
+
 	err = process(outfile, infile)
 	if err != nil {
 		log.Fatal(err)
 	}
+	if len(outFilename) > 0 {
+		outfile.Close()
+		if err = gofmt(); err != nil {
+			log.Fatal(err)
+		}
+	}
+
 	if autorun {
 		c := exec.Command("go", "run", outfile.Name())
 		c.Stdin, c.Stdout, c.Stderr = os.Stdin, os.Stdout, os.Stderr
