@@ -1,0 +1,12 @@
+A keyword: if
+An integer: 6
+An operator: *
+An integer: 9
+Unrecognized character: =
+Unrecognized character: =
+An integer: 42
+A keyword: then
+An identifier: else
+A float: 1.23
+Unrecognized character: .
+A keyword: end

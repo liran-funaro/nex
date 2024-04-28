@@ -3,6 +3,7 @@ package main
 
 import (
 	"bufio"
+	_ "embed"
 	"errors"
 	"fmt"
 	"go/format"
@@ -12,6 +13,7 @@ import (
 	"io"
 	"log"
 	"os"
+	"regexp"
 	"sort"
 	"strconv"
 	"strings"
@@ -19,14 +21,14 @@ import (
 	"github.com/gobuffalo/gogen/goimports"
 )
 
-type rule struct {
-	regex     []rune
-	code      string
-	startCode string
-	endCode   string
-	kid       []*rule
-	id        string
-}
+const (
+	kNil = iota
+	kRune
+	kClass
+	kWild
+	kStart
+	kEnd
+)
 
 var (
 	ErrInternal            = errors.New("internal error")
@@ -47,6 +49,38 @@ var (
 	ErrUnmatchedRAngle     = errors.New("unmatched '>'")
 )
 
+//go:embed lexer_template.go
+var lexerTextFull string
+
+func lexerText() (string, string, string, string, string) {
+	s := regexp.MustCompile(`(?s)^.*?
+// \[PREAMBLE PLACEHOLDER]
+(.*?)
+	// \[DFAS PLACEHOLDER]
+(.*?)
+// \[SYM TYPE PLACEHOLDER]
+.*?
+// \[LEX METHOD PLACEHOLDER]
+(.*?)
+	// \[LEX IMPLEMENTATION PLACEHOLDER]
+(.*?)
+// \[ERROR METHOD PLACEHOLDER]
+(.*?)$`).FindStringSubmatch(lexerTextFull)
+	return s[1], s[2], s[3], s[4], s[5]
+}
+
+var lexerIntro, lexerOutro, lexerLexMethodIntro, lexerLexMethodOutro, lexerErrorMethod = lexerText()
+
+var escapeMap = map[rune]rune{
+	'a': '\a',
+	'b': '\b',
+	'f': '\f',
+	'n': '\n',
+	'r': '\r',
+	't': '\t',
+	'v': '\v',
+}
+
 func ispunct(c rune) bool {
 	for _, r := range "!\"#$%&'()*+,-./:;<=>?@[\\]^_`{|}~" {
 		if c == r {
@@ -56,26 +90,22 @@ func ispunct(c rune) bool {
 	return false
 }
 
-var escapes = []rune("abfnrtv")
-var escaped = []rune("\a\b\f\n\r\t\v")
-
 func escape(c rune) rune {
-	for i, b := range escapes {
-		if b == c {
-			return escaped[i]
-		}
+	b, ok := escapeMap[c]
+	if ok {
+		return b
 	}
 	return -1
 }
 
-const (
-	kNil = iota
-	kRune
-	kClass
-	kWild
-	kStart
-	kEnd
-)
+type rule struct {
+	regex     []rune
+	code      string
+	startCode string
+	endCode   string
+	kid       []*rule
+	id        string
+}
 
 type edge struct {
 	kind   int    // Rune/Class/Wild/Nil.
@@ -84,6 +114,7 @@ type edge struct {
 	negate bool   // True if the character class is negated.
 	dst    *node  // Destination node.
 }
+
 type node struct {
 	e      edges // Outedges.
 	n      int   // Index number. Scoped to a family.
@@ -96,6 +127,7 @@ type edges []*edge
 func (e edges) Len() int {
 	return len(e)
 }
+
 func (e edges) Less(i, j int) bool {
 	return e[i].r < e[j].r
 }
@@ -735,8 +767,7 @@ func writeFamily(out *bufio.Writer, node *rule, lvl int) {
 	tab()
 	fmt.Fprintf(out, "OUTER%s%d:\n", node.id, lvl)
 	tab()
-	prefixReplacer.WriteString(out,
-		fmt.Sprintf("for { switch yylex.next(%v) {\n", lvl))
+	prefixReplacer.WriteString(out, fmt.Sprintf("for { switch yylex.next(%v) {\n", lvl))
 	for i, x := range node.kid {
 		tab()
 		fmt.Fprintf(out, "\tcase %d:\n", i)
@@ -765,246 +796,13 @@ func writeFamily(out *bufio.Writer, node *rule, lvl int) {
 	out.WriteString(node.endCode + "\n")
 }
 
-var lexertext = `
-import ("bufio";"io";"strings";"fmt")
-type frame struct {
-  i int
-  s string
-  line, column int
-}
-
-type Lexer struct {
-  // The lexer runs in its own goroutine, and communicates via channel 'ch'.
-  ch chan frame
-  ch_stop chan bool
-  // We record the level of nesting because the action could return, and a
-  // subsequent call expects to pick up where it left off. In other words,
-  // we're simulating a coroutine.
-  // TODO: Support a channel-based variant that compatible with Go's yacc.
-  stack []frame
-  stale bool
-
-  // The 'l' and 'c' fields were added for
-  // https://github.com/wagerlabs/docker/blob/65694e801a7b80930961d70c69cba9f2465459be/buildfile.nex
-  // Since then, I introduced the built-in Line() and Column() functions.
-  l, c int
-
-  parseResult interface{}
-  parseError error
-
-  // The following line makes it easy for scripts to insert fields in the
-  // generated code.
-  // [NEX_END_OF_LEXER_STRUCT]
-}
-
-// NewLexerWithInit creates a new Lexer object, runs the given callback on it,
-// then returns it.
-func NewLexerWithInit(in io.Reader, initFun func(*Lexer)) *Lexer {
-  yylex := new(Lexer)
-  if initFun != nil {
-    initFun(yylex)
-  }
-  yylex.ch = make(chan frame)
-  yylex.ch_stop = make(chan bool, 1)
-  var scan func(in *bufio.Reader, ch chan frame, ch_stop chan bool, family []dfa, line, column int) 
-  scan = func(in *bufio.Reader, ch chan frame, ch_stop chan bool, family []dfa, line, column int) {
-    // Index of DFA and length of highest-precedence match so far.
-    matchi, matchn := 0, -1
-    var buf []rune
-    n := 0
-    checkAccept := func(i int, st int) bool {
-      // Higher precedence match? DFAs are run in parallel, so matchn is at most len(buf), hence we may omit the length equality check.
-      if family[i].acc[st] && (matchn < n || matchi > i) {
-        matchi, matchn = i, n
-        return true
-      }
-      return false
-    }
-    var state [][2]int
-    for i := 0; i < len(family); i++ {
-      mark := make([]bool, len(family[i].startf))
-      // Every DFA starts at state 0.
-      st := 0
-      for {
-        state = append(state, [2]int{i, st})
-        mark[st] = true
-        // As we're at the start of input, follow all ^ transitions and append to our list of start states.
-        st = family[i].startf[st]
-        if -1 == st || mark[st] { break }
-        // We only check for a match after at least one transition.
-        checkAccept(i, st)
-      }
-    }
-    atEOF := false
-    stopped := false
-    for {
-      if n == len(buf) && !atEOF {
-        r,_,err := in.ReadRune()
-        switch err {
-        case io.EOF: atEOF = true
-        case nil:    buf = append(buf, r)
-        default:     panic(err)
-        }
-      }
-      if !atEOF {
-        r := buf[n]
-        n++
-        var nextState [][2]int
-        for _, x := range state {
-          x[1] = family[x[0]].f[x[1]](r)
-          if -1 == x[1] { continue }
-          nextState = append(nextState, x)
-          checkAccept(x[0], x[1])
-        }
-        state = nextState
-      } else {
-dollar:  // Handle $.
-        for _, x := range state {
-          mark := make([]bool, len(family[x[0]].endf))
-          for {
-            mark[x[1]] = true
-            x[1] = family[x[0]].endf[x[1]]
-            if -1 == x[1] || mark[x[1]] { break }
-            if checkAccept(x[0], x[1]) {
-              // Unlike before, we can break off the search. Now that we're at the end, there's no need to maintain the state of each DFA.
-              break dollar
-            }
-          }
-        }
-        state = nil
-      }
-
-      if state == nil {
-        lcUpdate := func(r rune) {
-          if r == '\n' {
-            line++
-            column = 0
-          } else {
-            column++
-          }
-        }
-        // All DFAs stuck. Return last match if it exists, otherwise advance by one rune and restart all DFAs.
-        if matchn == -1 {
-          if len(buf) == 0 {  // This can only happen at the end of input.
-            break
-          }
-          lcUpdate(buf[0])
-          buf = buf[1:]
-        } else {
-          text := string(buf[:matchn])
-          buf = buf[matchn:]
-          matchn = -1
-          select {
-            case ch <- frame{matchi, text, line, column}: {
-            }
-            case stopped = <- ch_stop: {
-            }
-          }
-          if stopped {
-            break
-          }
-          if len(family[matchi].nest) > 0 {
-            scan(bufio.NewReader(strings.NewReader(text)), ch, ch_stop, family[matchi].nest, line, column)
-          }
-          if atEOF {
-            break
-          }
-          for _, r := range text {
-            lcUpdate(r)
-          }
-        }
-        n = 0
-        for i := 0; i < len(family); i++ {
-          state = append(state, [2]int{i, 0})
-        }
-      }
-    }
-    ch <- frame{-1, "", line, column}
-  }
-  go scan(bufio.NewReader(in), yylex.ch, yylex.ch_stop, dfas, 0, 0)
-  return yylex
-}
-
-type dfa struct {
-  acc []bool  // Accepting states.
-  f []func(rune) int  // Transitions.
-  startf, endf []int  // Transitions at start and end of input.
-  nest []dfa
-}
-
-var dfas = []dfa{`
-
-var lexeroutro = `}
-
-func NewLexer(in io.Reader) *Lexer {
-  return NewLexerWithInit(in, nil)
-}
-
-func (yylex *Lexer) Stop() {
-  yylex.ch_stop <- true
-}
-
-// Text returns the matched text.
-func (yylex *Lexer) Text() string {
-  return yylex.stack[len(yylex.stack) - 1].s
-}
-
-// Line returns the current line number.
-// The first line is 0.
-func (yylex *Lexer) Line() int {
-  if len(yylex.stack) == 0 {
-    return 0
-  }
-  return yylex.stack[len(yylex.stack) - 1].line
-}
-
-// Column returns the current column number.
-// The first column is 0.
-func (yylex *Lexer) Column() int {
-  if len(yylex.stack) == 0 {
-    return 0
-  }
-  return yylex.stack[len(yylex.stack) - 1].column
-}
-
-func (yylex *Lexer) next(lvl int) int {
-  if lvl == len(yylex.stack) {
-    l, c := 0, 0
-    if lvl > 0 {
-      l, c = yylex.stack[lvl - 1].line, yylex.stack[lvl - 1].column
-    }
-    yylex.stack = append(yylex.stack, frame{0, "", l, c})
-  }
-  if lvl == len(yylex.stack) - 1 {
-    p := &yylex.stack[lvl]
-    *p = <-yylex.ch
-    yylex.stale = false
-  } else {
-    yylex.stale = true
-  }
-  return yylex.stack[lvl].i
-}
-
-func (yylex *Lexer) pop() {
-  yylex.stack = yylex.stack[:len(yylex.stack) - 1]
-}
-`
-
 func writeLex(out *bufio.Writer, root rule) {
 	if !customError {
-		prefixReplacer.WriteString(out, `
-func (yylex *Lexer) Error(e string) {
-  yylex.parseError = fmt.Errorf(fmt.Sprintf("%d:%d %s", yylex.Line(), yylex.Column(), e))
-}`)
+		prefixReplacer.WriteString(out, lexerErrorMethod)
 	}
-	prefixReplacer.WriteString(out, `
-// Lex runs the lexer. Always returns 0.
-// When the -s option is given, this function is not generated;
-// instead, the NN_FUN macro runs the lexer.
-func (yylex *Lexer) Lex(lval *yySymType) int {
-`)
+	prefixReplacer.WriteString(out, lexerLexMethodIntro)
 	writeFamily(out, &root, 0)
-	out.WriteString("\treturn 0\n}\n")
+	out.WriteString(lexerLexMethodOutro)
 }
 
 func writeNNFun(out *bufio.Writer, root rule) {
@@ -1160,13 +958,13 @@ func process(output io.Writer, input io.Reader) error {
 		buf = buf[i+1:]
 	}
 
-	prefixReplacer.WriteString(out, lexertext)
+	prefixReplacer.WriteString(out, lexerIntro)
 
 	for _, kid := range root.kid {
 		gen(out, kid)
 	}
 
-	prefixReplacer.WriteString(out, lexeroutro)
+	prefixReplacer.WriteString(out, lexerOutro)
 
 	if !standalone {
 		writeLex(out, root)

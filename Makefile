@@ -1,15 +1,10 @@
-export GOPATH     := $(abspath ../..)
-export NEX        := $(abspath ../../bin/nex)
+all: install test
 
-all: $(NEX) test
+install: nex/main.go nex/nex.go
+	go install ./nex
 
-$(NEX): main.go nex.go
-	go fmt nex
-	go install nex
-
-test: $(NEX) $(shell find test -type f)
-	go fmt nex nex/test
-	go test nex nex/test
+test: $(shell find test -type f)
+	go test ./test
 
 clean:
 	rm -f $(NEX)

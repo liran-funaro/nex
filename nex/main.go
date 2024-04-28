@@ -2,10 +2,10 @@ package main
 
 import (
 	"flag"
-	"io/ioutil"
 	"log"
 	"os"
 	"os/exec"
+	"path"
 	"strings"
 )
 
@@ -21,7 +21,7 @@ func init() {
 }
 
 func main() {
-	flag.StringVar(&prefix, "p", "yy", "name prefix to use in generated code")
+	flag.StringVar(&prefix, "p", "", "name prefix to use in generated code")
 	flag.StringVar(&outFilename, "o", "", `output file`)
 	flag.BoolVar(&standalone, "s", false, `standalone code; NN_FUN macro substitution, no Lex() method`)
 	flag.BoolVar(&customError, "e", false, `custom error func; no Error() method`)
@@ -61,30 +61,31 @@ func main() {
 			if outFilename == "" {
 				outFilename = basename + ".nn.go"
 			}
-			outfile, err = os.Create(outFilename)
-			dieErr(err, "nex")
-			defer outfile.Close()
 		}
 	}
 	if autorun {
-		tmpdir, err := ioutil.TempDir("", "nex")
+		tmpdir, err := os.MkdirTemp("", "nex")
 		dieIf(err != nil, "tempdir:", err)
 		defer func() {
 			dieErr(os.RemoveAll(tmpdir), "RemoveAll")
 		}()
-		outfile, err = os.Create(tmpdir + "/lets.go")
+		outFilename = path.Join(tmpdir, "lets.go")
+	}
+
+	if len(outFilename) > 0 {
+		outfile, err = os.Create(outFilename)
 		dieErr(err, "nex")
 		defer outfile.Close()
 	}
 
-	err = process(outfile, infile)
-	if err != nil {
+	if err = process(outfile, infile); err != nil {
 		log.Fatal(err)
 	}
+
 	if len(outFilename) > 0 {
 		outfile.Close()
 		if err = gofmt(); err != nil {
-			log.Fatal(err)
+			log.Fatalf("Failed formatting: %s", err)
 		}
 	}
 

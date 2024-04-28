@@ -2,7 +2,7 @@
 /./{ nChars++ }
 //
 package main
-import ("fmt";"os")
+import ("os")
 func main() {
   var nLines, nChars int
   NN_FUN(NewLexer(os.Stdin))

@@ -1,0 +1,2 @@
+if
+6 * 9 ==   42  then {one-line comment } else 1.23. end

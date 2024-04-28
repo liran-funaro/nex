@@ -1,14 +1,16 @@
 package main
 
 import (
+	_ "embed"
 	"fmt"
 	"io"
-	"io/ioutil"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"strings"
 	"testing"
+
+	"github.com/stretchr/testify/require"
 )
 
 var nexBin string
@@ -33,256 +35,100 @@ func init() {
 	panic("cannot find nex binary")
 }
 
-func dieErr(t *testing.T, err error, s string) {
-	if err != nil {
-		t.Fatalf("%s: %s", s, err)
-	}
-}
+//go:embed rp-input.txt
+var rpInput string
+
+//go:embed rp-output.txt
+var rpOutput string
 
 // Test the reverse-Polish notation calculator rp.{nex,y}.
 func TestNexPlusYacc(t *testing.T) {
-	tmpdir, err := ioutil.TempDir("", "nex")
-	dieErr(t, err, "TempDir")
-	defer func() {
-		dieErr(t, os.RemoveAll(tmpdir), "RemoveAll")
-	}()
+	tmpdir := t.TempDir()
 	run := func(s string) {
 		v := strings.Split(s, " ")
 		err := exec.Command(v[0], v[1:]...).Run()
-		dieErr(t, err, s)
+		require.NoError(t, err, s)
 	}
-	dieErr(t, copyToDir(tmpdir, "rp.nex"), "copy rp.nex")
-	dieErr(t, copyToDir(tmpdir, "rp.y"), "copy rp.y")
+	copyToDir(t, tmpdir, "rp.nex")
+	copyToDir(t, tmpdir, "rp.y")
 	wd, err := os.Getwd()
-	dieErr(t, err, "Getwd")
-	dieErr(t, os.Chdir(tmpdir), "Chdir")
+	require.NoError(t, err, "Getwd")
+	require.NoError(t, os.Chdir(tmpdir), "Chdir")
 	defer func() {
-		dieErr(t, os.Chdir(wd), "Chdir")
+		require.NoError(t, os.Chdir(wd), "Chdir")
 	}()
 	run(nexBin + " rp.nex")
-	run("go tool yacc rp.y")
+	run("goyacc rp.y")
 	run("go build y.go rp.nn.go")
 	cmd := exec.Command("./y")
-	cmd.Stdin = strings.NewReader(
-		`1 2 3 4 + * -
-9 8 * 7 * 3 2 * 1 * / n
-`)
-	want := "-13\n-84\n"
+	cmd.Stdin = strings.NewReader(rpInput)
 	got, err := cmd.CombinedOutput()
-	dieErr(t, err, "CombinedOutput")
-	if want != string(got) {
-		t.Fatalf("want %q, got %q", want, string(got))
+	require.NoError(t, err, "CombinedOutput")
+	if rpOutput != string(got) {
+		t.Fatalf("want %q, got %q", rpOutput, string(got))
 	}
 }
 
-func TestNexPrograms(t *testing.T) {
-	tmpdir, err := ioutil.TempDir("", "nex")
-	dieErr(t, err, "TempDir")
-	defer func() {
-		dieErr(t, os.RemoveAll(tmpdir), "RemoveAll")
-	}()
+//go:embed toy-input.txt
+var toyInput string
 
-	for _, x := range []struct {
+//go:embed toy-output.txt
+var toyOutput string
+
+//go:embed robo-input.txt
+var roboInput string
+
+//go:embed robo-output.txt
+var roboOutput string
+
+//go:embed peter-input.txt
+var peterInput string
+
+//go:embed peter-output.txt
+var peterOutput string
+
+func TestNexPrograms(t *testing.T) {
+	for i, x := range []struct {
 		prog, in, out string
 	}{
 		{"lc.nex", "no newline", "0 10\n"},
 		{"lc.nex", "one two three\nfour five six\n", "2 28\n"},
 
-		{"toy.nex", "if\t\n6 * 9 ==   42  then {one-line comment } else 1.23. end",
-			`A keyword: if
-An integer: 6
-An operator: *
-An integer: 9
-Unrecognized character: =
-Unrecognized character: =
-An integer: 42
-A keyword: then
-An identifier: else
-A float: 1.23
-Unrecognized character: .
-A keyword: end
-`},
+		{"toy.nex", toyInput, toyOutput},
 
 		{"wc.nex", "no newline", "0 0 0\n"},
 		{"wc.nex", "\n", "1 0 1\n"},
 		{"wc.nex", "1\na b\nA B C\n", "3 6 12\n"},
 		{"wc.nex", "one two three\nfour five six\n", "2 6 28\n"},
 
-		{"rob.nex",
-			`1 robot
-2 robo
-3 rob
-4 rob robot
-5 robot rob
-6 roboot
-`, "2 robo\n3 rob\n6 roboot\n"},
+		{"rob.nex", roboInput, roboOutput},
 
-		{"peter.nex",
-			`    #######
-   #########
-  ####  #####
- ####    ####   #
- ####      #####
-####        ###
-########   #####
-#### #########
-#### #  # ####
-## #  ###   ##
-###    #  ###
-###    ##
- ##   #
-  #   ####
-  # #
-##   #   ##
-`,
-			`rect 5 6 1 2
-rect 6 7 1 2
-rect 7 8 1 2
-rect 8 9 1 2
-rect 9 10 1 2
-rect 10 11 1 2
-rect 11 12 1 2
-rect 4 5 2 3
-rect 5 6 2 3
-rect 6 7 2 3
-rect 7 8 2 3
-rect 8 9 2 3
-rect 9 10 2 3
-rect 10 11 2 3
-rect 11 12 2 3
-rect 12 13 2 3
-rect 3 4 3 4
-rect 4 5 3 4
-rect 5 6 3 4
-rect 6 7 3 4
-rect 9 10 3 4
-rect 10 11 3 4
-rect 11 12 3 4
-rect 12 13 3 4
-rect 13 14 3 4
-rect 2 3 4 5
-rect 3 4 4 5
-rect 4 5 4 5
-rect 5 6 4 5
-rect 10 11 4 5
-rect 11 12 4 5
-rect 12 13 4 5
-rect 13 14 4 5
-rect 17 18 4 5
-rect 2 3 5 6
-rect 3 4 5 6
-rect 4 5 5 6
-rect 5 6 5 6
-rect 12 13 5 6
-rect 13 14 5 6
-rect 14 15 5 6
-rect 15 16 5 6
-rect 16 17 5 6
-rect 1 2 6 7
-rect 2 3 6 7
-rect 3 4 6 7
-rect 4 5 6 7
-rect 13 14 6 7
-rect 14 15 6 7
-rect 15 16 6 7
-rect 1 2 7 8
-rect 2 3 7 8
-rect 3 4 7 8
-rect 4 5 7 8
-rect 5 6 7 8
-rect 6 7 7 8
-rect 7 8 7 8
-rect 8 9 7 8
-rect 12 13 7 8
-rect 13 14 7 8
-rect 14 15 7 8
-rect 15 16 7 8
-rect 16 17 7 8
-rect 1 2 8 9
-rect 2 3 8 9
-rect 3 4 8 9
-rect 4 5 8 9
-rect 6 7 8 9
-rect 7 8 8 9
-rect 8 9 8 9
-rect 9 10 8 9
-rect 10 11 8 9
-rect 11 12 8 9
-rect 12 13 8 9
-rect 13 14 8 9
-rect 14 15 8 9
-rect 1 2 9 10
-rect 2 3 9 10
-rect 3 4 9 10
-rect 4 5 9 10
-rect 6 7 9 10
-rect 9 10 9 10
-rect 11 12 9 10
-rect 12 13 9 10
-rect 13 14 9 10
-rect 14 15 9 10
-rect 1 2 10 11
-rect 2 3 10 11
-rect 4 5 10 11
-rect 7 8 10 11
-rect 8 9 10 11
-rect 9 10 10 11
-rect 13 14 10 11
-rect 14 15 10 11
-rect 1 2 11 12
-rect 2 3 11 12
-rect 3 4 11 12
-rect 8 9 11 12
-rect 11 12 11 12
-rect 12 13 11 12
-rect 13 14 11 12
-rect 1 2 12 13
-rect 2 3 12 13
-rect 3 4 12 13
-rect 8 9 12 13
-rect 9 10 12 13
-rect 2 3 13 14
-rect 3 4 13 14
-rect 7 8 13 14
-rect 3 4 14 15
-rect 7 8 14 15
-rect 8 9 14 15
-rect 9 10 14 15
-rect 10 11 14 15
-rect 3 4 15 16
-rect 5 6 15 16
-rect 1 2 16 17
-rect 2 3 16 17
-rect 6 7 16 17
-rect 10 11 16 17
-rect 11 12 16 17
-`},
+		{"peter.nex", peterInput, peterOutput},
 		{"peter2.nex", "###\n#\n####\n", "rect 1 4 1 2\nrect 1 2 2 3\nrect 1 5 3 4\n"},
 		{"u.nex", "١ + ٢ + ... + ١٨ = 一百五十三", "1 + 2 + ... + 18 = 153"},
 		{"bug50.nex", "# comment 1\nhello42:\n# comment 2\n\na\nblah:42x\n", "COMMENT: # comment 1\nTEXT: hello42\nERROR: :\nCOMMENT: # comment 2\nTEXT: a\nTEXT: blah:42x\n"},
 	} {
-		cmd := exec.Command(nexBin, "-r", "-s", x.prog)
-		cmd.Stdin = strings.NewReader(x.in)
-		got, err := cmd.CombinedOutput()
-		dieErr(t, err, x.prog+" "+string(got))
-		if string(got) != x.out {
-			t.Fatalf("program: %s\nwant %q, got %q", x.prog, x.out, string(got))
-		}
+		t.Run(x.prog, func(t *testing.T) {
+			t.Parallel()
+			cmd := exec.Command(nexBin, "-r", "-s", x.prog)
+			cmd.Stdin = strings.NewReader(x.in)
+			got, err := cmd.CombinedOutput()
+			require.NoError(t, err, fmt.Sprintf("program (%d): %s\ngot: %s\n", i, x.prog, string(got)))
+			if string(got) != x.out {
+				t.Fatalf("program: %s\nwant %q, got %q", x.prog, x.out, string(got))
+			}
+		})
 	}
 }
 
 // To save time, we combine several test cases into a single nex program.
 func TestGiantProgram(t *testing.T) {
-	tmpdir, err := ioutil.TempDir("", "nex")
-	dieErr(t, err, "TempDir")
+	tmpdir := t.TempDir()
 	wd, err := os.Getwd()
-	dieErr(t, err, "Getwd")
-	dieErr(t, os.Chdir(tmpdir), "Chdir")
+	require.NoError(t, err, "Getwd")
+	require.NoError(t, os.Chdir(tmpdir), "Chdir")
 	defer func() {
-		dieErr(t, os.RemoveAll(tmpdir), "RemoveAll")
-	}()
-	defer func() {
-		dieErr(t, os.Chdir(wd), "Chdir")
+		require.NoError(t, os.Chdir(wd), "Chdir")
 	}()
 	s := "package main\n"
 	body := ""
@@ -396,8 +242,8 @@ func TestGiantProgram(t *testing.T) {
 `, "abcdefghijmnopabcoq", "0ij1q"},
 	} {
 		id := fmt.Sprintf("%v", i)
-		s += `import "./nex_test` + id + "\"\n"
-		dieErr(t, os.Mkdir("nex_test"+id, 0777), "Mkdir")
+		s += `import "main/nex_test` + id + "\"\n"
+		require.NoError(t, os.Mkdir("nex_test"+id, 0777), "Mkdir")
 		// Ugly hack to import packages.
 		prog := x.prog
 		importLine := ""
@@ -406,7 +252,7 @@ func TestGiantProgram(t *testing.T) {
 			prog = v[1]
 			importLine = "import " + v[0]
 		}
-		dieErr(t, ioutil.WriteFile(id+".nex", []byte(prog+`//
+		require.NoError(t, os.WriteFile(id+".nex", []byte(prog+`//
 package nex_test`+id+`
 
 `+importLine+`
@@ -424,33 +270,26 @@ func Go() {
 }
 `), 0777), "WriteFile")
 		_, cerr := exec.Command(nexBin, "-o", filepath.Join("nex_test"+id, "tmp.go"), id+".nex").CombinedOutput()
-		dieErr(t, cerr, "nex: "+s)
+		require.NoError(t, cerr, "nex: "+s)
 		body += "nex_test" + id + ".Go()\n"
 	}
 	s += "func main() {\n" + body + "}\n"
-	err = ioutil.WriteFile("tmp.go", []byte(s), 0777)
-	dieErr(t, err, "WriteFile")
-	output, err := exec.Command("go", "run", "tmp.go").CombinedOutput()
-	dieErr(t, err, string(output))
+	err = os.WriteFile("tmp.go", []byte(s), 0777)
+	require.NoError(t, err, "WriteFile")
+	output, err := exec.Command("go", "mod", "init", "main").CombinedOutput()
+	require.NoError(t, err, string(output))
+	output, err = exec.Command("go", "run", ".").CombinedOutput()
+	require.NoError(t, err, string(output))
 }
 
-func copy(dst, src string) error {
+func copyToDir(t *testing.T, dst, src string) {
+	dst = filepath.Join(dst, filepath.Base(src))
 	s, err := os.Open(src)
-	if err != nil {
-		return err
-	}
-	defer s.Close()
+	require.NoError(t, err)
+	defer func() { require.NoError(t, s.Close()) }()
 	d, err := os.Create(dst)
-	if err != nil {
-		return err
-	}
-	if _, err := io.Copy(d, s); err != nil {
-		d.Close()
-		return err
-	}
-	return d.Close()
-}
-
-func copyToDir(dst, src string) error {
-	return copy(filepath.Join(dst, filepath.Base(src)), src)
+	require.NoError(t, err)
+	defer func() { require.NoError(t, d.Close()) }()
+	_, err = io.Copy(d, s)
+	require.NoError(t, err)
 }

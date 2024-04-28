@@ -1,0 +1,28 @@
+ID10T
+7 salary $50000.00
+8a disinterest $3.56
+21 other income $305326.13
+22 total income $355329.69
+40 deduction $5.00
+43 taxable income $355324.69
+44 tax $116701.70
+99  $99.50
+100  $100.00
+101  $100.49
+
+ID10T, TPS Worksheet
+1 bank error $305326.13
+2bad  $1.23
+2badwrongifrounded  $75110.23
+2  $75110.23
+3  $0.00
+4  $5.00
+5  $5.00
+6  $5.00
+10  $5.00
+
+27B-6
+99  $100.00
+100  $100.00
+101  $100.00
+

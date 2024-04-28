@@ -1,0 +1,43 @@
+ID10T {
+  7 salary = $50000  // Initech salary.
+  8a disinterest =  // Right-hand side of assignment can span multiple lines.
+    $0.01  // Additions are implicit.
+    $0.22
+    $3.33
+  21 other income = $305326.13  // Salami slicing.
+  22 total income = 7 8a 21
+  40 deduction = [ID10T, TPS Worksheet:10]  // Line from another form.
+  43 taxable income = 22 - 40
+  44 tax = $123.45 + 43 * 33% - $678.90  // Test precedence, percentages.
+  99 = $99.50
+  100 = $100.00
+  101 = $100.49
+}
+
+ID10T, TPS Worksheet {
+  1 bank error = [ID10T:21]
+  // Divide by $2500 and round up.
+  // Looks wacky because all computations are in cents, but it works.
+  // However, in whole dollar mode, any rounding is likely undesirable.
+  2bad = (1 + $2500.00 - $0.01) / $2500.00
+  // The following is an example of a formula that is wrongly computed in
+  // whole dollar mode.
+  2badwrongifrounded = 1 * 2bad * 0.2%
+  // The right way: multiply before potential whole dollar rounding.
+  2 = 1 * ((1 + $2500.00 - $0.01) / $2500.00) * 0.2%  // Fractional percentage.
+  // The line '0' is reserved. It always means $0.
+  3 = clip(0 - $5)  // This should be 0.
+  4 = clip($5 - 0)  // This should be $5.
+  5 = max(3, 4)
+  6 = min(5, 2)
+  10 = 6
+}
+
+// Test rounding to dollars.
+whole_dollars_only = 1
+
+27B-6 {
+  99 = [ID10T:99]
+  100 = [ID10T:100]
+  101 = [ID10T:101]
+}
