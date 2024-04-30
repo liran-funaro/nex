@@ -1,4 +1,4 @@
-package main
+package nex
 
 // [PREAMBLE PLACEHOLDER]
 import (
@@ -8,16 +8,10 @@ import (
 	"strings"
 )
 
-type frame struct {
-	i            int
-	s            string
-	line, column int
-}
-
 type Lexer struct {
 	// The lexer runs in its own goroutine, and communicates via channel 'ch'.
-	ch      chan frame
-	ch_stop chan bool
+	ch     chan frame
+	chStop chan bool
 	// We record the level of nesting because the action could return, and a
 	// subsequent call expects to pick up where it left off. In other words,
 	// we're simulating a coroutine.
@@ -25,12 +19,7 @@ type Lexer struct {
 	stack []frame
 	stale bool
 
-	// The 'l' and 'c' fields were added for
-	// https://github.com/wagerlabs/docker/blob/65694e801a7b80930961d70c69cba9f2465459be/buildfile.nex
-	// Since then, I introduced the built-in Line() and Column() functions.
-	l, c int
-
-	parseResult interface{}
+	parseResult any
 	parseError  error
 
 	// The following line makes it easy for scripts to insert fields in the
@@ -38,162 +27,32 @@ type Lexer struct {
 	// [NEX_END_OF_LEXER_STRUCT]
 }
 
-// NewLexerWithInit creates a new Lexer object, runs the given callback on it,
-// then returns it.
-func NewLexerWithInit(in io.Reader, initFun func(*Lexer)) *Lexer {
-	yylex := new(Lexer)
-	if initFun != nil {
-		initFun(yylex)
-	}
-	yylex.ch = make(chan frame)
-	yylex.ch_stop = make(chan bool, 1)
-	var scan func(in *bufio.Reader, ch chan frame, ch_stop chan bool, family []dfa, line, column int)
-	scan = func(in *bufio.Reader, ch chan frame, ch_stop chan bool, family []dfa, line, column int) {
-		// Index of DFA and length of highest-precedence match so far.
-		matchi, matchn := 0, -1
-		var buf []rune
-		n := 0
-		checkAccept := func(i int, st int) bool {
-			// Higher precedence match? DFAs are run in parallel, so matchn is at most len(buf), hence we may omit the length equality check.
-			if family[i].acc[st] && (matchn < n || matchi > i) {
-				matchi, matchn = i, n
-				return true
-			}
-			return false
-		}
-		var state [][2]int
-		for i := 0; i < len(family); i++ {
-			mark := make([]bool, len(family[i].startf))
-			// Every DFA starts at state 0.
-			st := 0
-			for {
-				state = append(state, [2]int{i, st})
-				mark[st] = true
-				// As we're at the start of input, follow all ^ transitions and append to our list of start states.
-				st = family[i].startf[st]
-				if -1 == st || mark[st] {
-					break
-				}
-				// We only check for a match after at least one transition.
-				checkAccept(i, st)
-			}
-		}
-		atEOF := false
-		stopped := false
-		for {
-			if n == len(buf) && !atEOF {
-				r, _, err := in.ReadRune()
-				switch err {
-				case io.EOF:
-					atEOF = true
-				case nil:
-					buf = append(buf, r)
-				default:
-					panic(err)
-				}
-			}
-			if !atEOF {
-				r := buf[n]
-				n++
-				var nextState [][2]int
-				for _, x := range state {
-					x[1] = family[x[0]].f[x[1]](r)
-					if -1 == x[1] {
-						continue
-					}
-					nextState = append(nextState, x)
-					checkAccept(x[0], x[1])
-				}
-				state = nextState
-			} else {
-			dollar: // Handle $.
-				for _, x := range state {
-					mark := make([]bool, len(family[x[0]].endf))
-					for {
-						mark[x[1]] = true
-						x[1] = family[x[0]].endf[x[1]]
-						if -1 == x[1] || mark[x[1]] {
-							break
-						}
-						if checkAccept(x[0], x[1]) {
-							// Unlike before, we can break off the search. Now that we're at the end, there's no need to maintain the state of each DFA.
-							break dollar
-						}
-					}
-				}
-				state = nil
-			}
-
-			if state == nil {
-				lcUpdate := func(r rune) {
-					if r == '\n' {
-						line++
-						column = 0
-					} else {
-						column++
-					}
-				}
-				// All DFAs stuck. Return last match if it exists, otherwise advance by one rune and restart all DFAs.
-				if matchn == -1 {
-					if len(buf) == 0 { // This can only happen at the end of input.
-						break
-					}
-					lcUpdate(buf[0])
-					buf = buf[1:]
-				} else {
-					text := string(buf[:matchn])
-					buf = buf[matchn:]
-					matchn = -1
-					select {
-					case ch <- frame{matchi, text, line, column}:
-						{
-						}
-					case stopped = <-ch_stop:
-						{
-						}
-					}
-					if stopped {
-						break
-					}
-					if len(family[matchi].nest) > 0 {
-						scan(bufio.NewReader(strings.NewReader(text)), ch, ch_stop, family[matchi].nest, line, column)
-					}
-					if atEOF {
-						break
-					}
-					for _, r := range text {
-						lcUpdate(r)
-					}
-				}
-				n = 0
-				for i := 0; i < len(family); i++ {
-					state = append(state, [2]int{i, 0})
-				}
-			}
-		}
-		ch <- frame{-1, "", line, column}
-	}
-	go scan(bufio.NewReader(in), yylex.ch, yylex.ch_stop, dfas, 0, 0)
-	return yylex
-}
-
-type dfa struct {
-	acc          []bool           // Accepting states.
-	f            []func(rune) int // Transitions.
-	startf, endf []int            // Transitions at start and end of input.
-	nest         []dfa
-}
-
-var dfas = []dfa{
-	// [DFAS PLACEHOLDER]
-}
-
+// NewLexer creates a new lexer without init.
 func NewLexer(in io.Reader) *Lexer {
 	return NewLexerWithInit(in, nil)
 }
 
+// NewLexerWithInit creates a new Lexer object, runs the given callback on it,
+// then returns it.
+func NewLexerWithInit(in io.Reader, initFun func(*Lexer)) *Lexer {
+	yylex := &Lexer{
+		ch:     make(chan frame),
+		chStop: make(chan bool, 1),
+	}
+	if initFun != nil {
+		initFun(yylex)
+	}
+	s := scanner{
+		family: dfaStates,
+		ch:     yylex.ch,
+		chStop: yylex.chStop,
+	}
+	go s.scan(bufio.NewReader(in))
+	return yylex
+}
+
 func (yylex *Lexer) Stop() {
-	yylex.ch_stop <- true
+	yylex.chStop <- true
 }
 
 // Text returns the matched text.
@@ -219,6 +78,172 @@ func (yylex *Lexer) Column() int {
 	return yylex.stack[len(yylex.stack)-1].column
 }
 
+type frame struct {
+	i            int
+	s            string
+	line, column int
+}
+
+type dfa struct {
+	acc          []bool           // Accepting states.
+	f            []func(rune) int // Transitions.
+	startf, endf []int            // Transitions at start and end of input.
+	nest         []dfa
+}
+
+type state struct {
+	dfaIndex   int
+	stateIndex int
+}
+
+type scanner struct {
+	family                                   []dfa
+	line, column                             int
+	matchDfaIndex, matchBufferPos, bufferPos int
+	ch                                       chan frame
+	chStop                                   chan bool
+}
+
+func (s *scanner) checkStateAccept(state state) bool {
+	return s.checkAccept(state.dfaIndex, state.stateIndex)
+}
+
+func (s *scanner) checkAccept(dfaIndex int, st int) bool {
+	// Higher precedence match? DFAs are run in parallel, so matchBufferPos is at most len(buf),
+	// hence we may omit the length equality check.
+	if s.family[dfaIndex].acc[st] && (s.matchBufferPos < s.bufferPos || dfaIndex < s.matchDfaIndex) {
+		s.matchDfaIndex, s.matchBufferPos = dfaIndex, s.bufferPos
+		return true
+	}
+	return false
+}
+
+func (s *scanner) lcUpdate(r rune) {
+	if r == '\n' {
+		s.line++
+		s.column = 0
+	} else {
+		s.column++
+	}
+}
+
+func (s *scanner) scan(in *bufio.Reader) {
+	s.matchDfaIndex = 0
+	s.matchBufferPos = -1
+	s.bufferPos = 0
+
+	var states []state
+	for i, f := range s.family {
+		mark := make([]bool, len(f.startf))
+		// Every DFA starts at state 0.
+		st := 0
+		for {
+			states = append(states, state{i, st})
+			mark[st] = true
+			// As we're at the start of input, follow all ^ transitions and append to our list of start states.
+			st = f.startf[st]
+			if -1 == st || mark[st] {
+				break
+			}
+			// We only check for a match after at least one transition.
+			s.checkAccept(i, st)
+		}
+	}
+
+	var buf []rune
+	atEOF := false
+	stopped := false
+	for {
+		if len(buf) == s.bufferPos && !atEOF {
+			r, _, err := in.ReadRune()
+			switch err {
+			case io.EOF:
+				atEOF = true
+			case nil:
+				buf = append(buf, r)
+			default:
+				panic(err)
+			}
+		}
+		if !atEOF {
+			r := buf[s.bufferPos]
+			s.bufferPos++
+			var nextStates []state
+			for _, x := range states {
+				x.stateIndex = s.family[x.dfaIndex].f[x.stateIndex](r)
+				if -1 == x.stateIndex {
+					continue
+				}
+				nextStates = append(nextStates, x)
+				s.checkStateAccept(x)
+			}
+			states = nextStates
+		} else {
+		dollar: // Handle $.
+			for _, x := range states {
+				mark := make([]bool, len(s.family[x.dfaIndex].endf))
+				for {
+					mark[x.stateIndex] = true
+					x.stateIndex = s.family[x.dfaIndex].endf[x.stateIndex]
+					if -1 == x.stateIndex || mark[x.stateIndex] {
+						break
+					}
+					if s.checkStateAccept(x) {
+						// Unlike before, we can break off the search.
+						// Now that we're at the end, there's no need to maintain the state of each DFA.
+						break dollar
+					}
+				}
+			}
+			states = nil
+		}
+
+		if states == nil {
+			// All DFAs stuck. Return last match if it exists, otherwise advance by one rune and restart all DFAs.
+			if s.matchBufferPos == -1 {
+				if len(buf) == 0 { // This can only happen at the end of input.
+					break
+				}
+				s.lcUpdate(buf[0])
+				buf = buf[1:]
+			} else {
+				text := string(buf[:s.matchBufferPos])
+				buf = buf[s.matchBufferPos:]
+				s.matchBufferPos = -1
+				select {
+				case s.ch <- frame{s.matchDfaIndex, text, s.line, s.column}:
+				case stopped = <-s.chStop:
+				}
+				if stopped {
+					break
+				}
+				nested := s.family[s.matchDfaIndex].nest
+				if len(nested) > 0 {
+					ns := scanner{
+						family: nested,
+						line:   s.line,
+						column: s.column,
+						ch:     s.ch,
+						chStop: s.chStop,
+					}
+					ns.scan(bufio.NewReader(strings.NewReader(text)))
+				}
+				if atEOF {
+					break
+				}
+				for _, r := range text {
+					s.lcUpdate(r)
+				}
+			}
+			s.bufferPos = 0
+			for i := 0; i < len(s.family); i++ {
+				states = append(states, state{i, 0})
+			}
+		}
+	}
+	s.ch <- frame{-1, "", s.line, s.column}
+}
+
 func (yylex *Lexer) next(lvl int) int {
 	if lvl == len(yylex.stack) {
 		l, c := 0, 0
@@ -228,8 +253,7 @@ func (yylex *Lexer) next(lvl int) int {
 		yylex.stack = append(yylex.stack, frame{0, "", l, c})
 	}
 	if lvl == len(yylex.stack)-1 {
-		p := &yylex.stack[lvl]
-		*p = <-yylex.ch
+		yylex.stack[lvl] = <-yylex.ch
 		yylex.stale = false
 	} else {
 		yylex.stale = true
@@ -240,10 +264,6 @@ func (yylex *Lexer) next(lvl int) int {
 func (yylex *Lexer) pop() {
 	yylex.stack = yylex.stack[:len(yylex.stack)-1]
 }
-
-// [SYM TYPE PLACEHOLDER]
-
-type yySymType any
 
 // [LEX METHOD PLACEHOLDER]
 
@@ -260,3 +280,9 @@ func (yylex *Lexer) Lex(lval *yySymType) int {
 func (yylex *Lexer) Error(e string) {
 	yylex.parseError = fmt.Errorf(fmt.Sprintf("%d:%d %s", yylex.Line(), yylex.Column(), e))
 }
+
+// [SUFFIX PLACEHOLDER]
+
+type yySymType any
+
+var dfaStates []dfa

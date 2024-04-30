@@ -1,12 +1,9 @@
+.PHONY: all install test
+
 all: install test
 
-install: nex/main.go nex/nex.go
-	go install ./nex
+install: nex.go $(shell find nex -type f)
+	go install github.com/liran-funaro/nex
 
-test: $(shell find test -type f)
-	go test ./test
-
-clean:
-	rm -f $(NEX)
-
-.PHONY: all test clean
+test: nex_test.go $(shell find test-data -type f)
+	go test github.com/liran-funaro/nex

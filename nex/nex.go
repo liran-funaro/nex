@@ -1,8 +1,9 @@
-// Substantial copy-and-paste from src/pkg/regexp.
-package main
+// Package nex has substantial copy-and-paste from src/pkg/regexp.
+package nex
 
 import (
 	"bufio"
+	"bytes"
 	_ "embed"
 	"errors"
 	"fmt"
@@ -14,20 +15,9 @@ import (
 	"log"
 	"os"
 	"regexp"
-	"sort"
-	"strconv"
 	"strings"
 
-	"github.com/gobuffalo/gogen/goimports"
-)
-
-const (
-	kNil = iota
-	kRune
-	kClass
-	kWild
-	kStart
-	kEnd
+	"golang.org/x/tools/imports"
 )
 
 var (
@@ -47,52 +37,47 @@ var (
 	ErrUnexpectedLAngle    = errors.New("unexpected '<'")
 	ErrUnmatchedLAngle     = errors.New("unmatched '<'")
 	ErrUnmatchedRAngle     = errors.New("unmatched '>'")
+
+	escapeMap = map[rune]rune{
+		'a': '\a',
+		'b': '\b',
+		'f': '\f',
+		'n': '\n',
+		'r': '\r',
+		't': '\t',
+		'v': '\v',
+	}
+	punctuationMarks = "!\"#$%&'()*+,-./:;<=>?@[\\]^_`{|}~"
+
+	lexerCode, lexerLexMethodIntro, lexerLexMethodOutro, lexerErrorMethod = lexerText()
 )
 
 //go:embed lexer_template.go
 var lexerTextFull string
 
-func lexerText() (string, string, string, string, string) {
-	s := regexp.MustCompile(`(?s)^.*?
+func lexerText() (string, string, string, string) {
+	s := regexp.MustCompile(
+		`(?s)^.*?
 // \[PREAMBLE PLACEHOLDER]
 (.*?)
-	// \[DFAS PLACEHOLDER]
-(.*?)
-// \[SYM TYPE PLACEHOLDER]
-.*?
 // \[LEX METHOD PLACEHOLDER]
 (.*?)
 	// \[LEX IMPLEMENTATION PLACEHOLDER]
 (.*?)
 // \[ERROR METHOD PLACEHOLDER]
-(.*?)$`).FindStringSubmatch(lexerTextFull)
-	return s[1], s[2], s[3], s[4], s[5]
-}
-
-var lexerIntro, lexerOutro, lexerLexMethodIntro, lexerLexMethodOutro, lexerErrorMethod = lexerText()
-
-var escapeMap = map[rune]rune{
-	'a': '\a',
-	'b': '\b',
-	'f': '\f',
-	'n': '\n',
-	'r': '\r',
-	't': '\t',
-	'v': '\v',
+(.*?)
+// \[SUFFIX PLACEHOLDER]
+.*$`,
+	).FindStringSubmatch(lexerTextFull)
+	return s[1], s[2], s[3], s[4]
 }
 
 func ispunct(c rune) bool {
-	for _, r := range "!\"#$%&'()*+,-./:;<=>?@[\\]^_`{|}~" {
-		if c == r {
-			return true
-		}
-	}
-	return false
+	return strings.ContainsRune(punctuationMarks, c)
 }
 
 func escape(c rune) rune {
-	b, ok := escapeMap[c]
-	if ok {
+	if b, ok := escapeMap[c]; ok {
 		return b
 	}
 	return -1
@@ -107,935 +92,384 @@ type rule struct {
 	id        string
 }
 
-type edge struct {
-	kind   int    // Rune/Class/Wild/Nil.
-	r      rune   // Rune for rune edges.
-	lim    []rune // Pairs of limits for character class edges.
-	negate bool   // True if the character class is negated.
-	dst    *node  // Destination node.
+type Builder struct {
+	Standalone   bool
+	CustomError  bool
+	CustomPrefix string
+	Result       BuildResult
+
+	in             *bufio.Reader
+	out            *bufio.Writer
+	replacer       *strings.Replacer
+	lineno         int
+	r              rune
+	root           rule
+	needRootRAngle bool
+	err            error
 }
 
-type node struct {
-	e      edges // Outedges.
-	n      int   // Index number. Scoped to a family.
-	accept bool  // True if this is an accepting state.
-	set    []int // The NFA nodes represented by a DFA node.
+type BuildResult struct {
+	Lexer  []byte
+	NfaDot []byte
+	DfaDot []byte
 }
 
-type edges []*edge
-
-func (e edges) Len() int {
-	return len(e)
+func (b *Builder) flush() {
+	b.err = b.out.Flush()
 }
 
-func (e edges) Less(i, j int) bool {
-	return e[i].r < e[j].r
+func (b *Builder) write(p []byte) {
+	if b.err != nil {
+		return
+	}
+	_, b.err = b.out.Write(p)
 }
 
-func (e edges) Swap(i, j int) {
-	e[i], e[j] = e[j], e[i]
+func (b *Builder) writeString(s string) {
+	if b.err != nil {
+		return
+	}
+	_, b.err = b.out.WriteString(s)
 }
 
-type RuneSlice []rune
+func (b *Builder) writeStringWithReplace(s string) {
+	if b.err != nil {
+		return
+	}
+	if b.replacer != nil {
+		_, b.err = b.replacer.WriteString(b.out, s)
+	} else {
+		b.writeString(s)
+	}
+}
 
-func (p RuneSlice) Len() int           { return len(p) }
-func (p RuneSlice) Less(i, j int) bool { return p[i] < p[j] }
-func (p RuneSlice) Swap(i, j int)      { p[i], p[j] = p[j], p[i] }
+func (b *Builder) writeByte(c byte) {
+	if b.err != nil {
+		return
+	}
+	b.err = b.out.WriteByte(c)
+}
 
-// Print a graph in DOT format given the start node.
-//
-//	$ dot -Tps input.dot -o output.ps
-func writeDotGraph(outf *os.File, start *node, id string) {
-	done := make(map[*node]bool)
-	var show func(*node)
-	show = func(u *node) {
-		if u.accept {
-			fmt.Fprintf(outf, "  %v[style=filled,color=green];\n", u.n)
-		}
-		done[u] = true
-		for _, e := range u.e {
-			// We use -1 to denote the dead end node in DFAs.
-			if e.dst.n == -1 {
-				continue
-			}
-			label := ""
-			runeToDot := func(r rune) string {
-				if strconv.IsPrint(r) {
-					return fmt.Sprintf("%v", string(r))
-				}
-				return fmt.Sprintf("U+%X", int(r))
-			}
-			switch e.kind {
-			case kRune:
-				label = fmt.Sprintf("[label=%q]", runeToDot(e.r))
-			case kWild:
-				label = "[color=blue]"
-			case kClass:
-				label = "[label=\"["
-				if e.negate {
-					label += "^"
-				}
-				for i := 0; i < len(e.lim); i += 2 {
-					label += runeToDot(e.lim[i])
-					if e.lim[i] != e.lim[i+1] {
-						label += "-" + runeToDot(e.lim[i+1])
-					}
-				}
-				label += "]\"]"
-			}
-			fmt.Fprintf(outf, "  %v -> %v%v;\n", u.n, e.dst.n, label)
-		}
-		for _, e := range u.e {
-			if !done[e.dst] {
-				show(e.dst)
-			}
+func (b *Builder) writef(format string, a ...any) {
+	if b.err != nil {
+		return
+	}
+	_, b.err = fmt.Fprintf(b.out, format, a...)
+}
+
+func (b *Builder) writefWithReplace(format string, a ...any) {
+	if b.err != nil {
+		return
+	}
+	if b.replacer != nil {
+		_, b.err = b.replacer.WriteString(b.out, fmt.Sprintf(format, a...))
+	} else {
+		b.writef(format, a...)
+	}
+}
+
+func (b *Builder) genDFAs(x *rule) {
+	// Regex -> NFA
+	nfaGraph := BuildNfa(x)
+	b.Result.NfaDot = dumpDotGraph(nfaGraph.Start, "NFA_"+x.id)
+
+	// NFA -> DFA
+	dfaGraph := BuildDfa(nfaGraph)
+	b.Result.DfaDot = dumpDotGraph(dfaGraph.Start, "DFA_"+x.id)
+
+	// DFA -> Go
+	b.writef("\n{ // %v\n acc: []bool{", string(x.regex))
+	for _, v := range dfaGraph.Nodes {
+		b.writef("%t,", v.accept)
+	}
+	b.writeString("},\n startf: []int{")
+	for _, v := range dfaGraph.Nodes {
+		if e := v.getEdgeKind(kStart); len(e) > 0 {
+			b.writef("%d,", e[0].dst.n)
+		} else {
+			b.writeString("-1,")
 		}
 	}
-	fmt.Fprintf(outf, "digraph %v {\n  0[shape=box];\n", id)
-	show(start)
-	fmt.Fprintln(outf, "}")
+	b.writeString("},\n endf: []int{")
+	for _, v := range dfaGraph.Nodes {
+		if e := v.getEdgeKind(kEnd); len(e) > 0 {
+			b.writef("%d,", e[0].dst.n)
+		} else {
+			b.writeString("-1,")
+		}
+	}
+	b.writeString("},\n f: []func(rune) int{\n")
+	for _, v := range dfaGraph.Nodes {
+		b.writeString("func(r rune) int {\n")
+		if runeE := v.getEdgeKind(kRune); len(runeE) > 0 {
+			b.writeString("switch(r) {\n")
+			for _, e := range runeE {
+				b.writef("case %q: return %d\n", e.r, e.dst.n)
+			}
+			b.writeString("}\n")
+		}
+		if classE := v.getEdgeKind(kClass); len(classE) > 0 {
+			b.writeString("switch {\n")
+			for _, e := range classE {
+				b.writef("case %q <= r && r <= %q: return %d\n", e.lim[0], e.lim[1], e.dst.n)
+			}
+			b.writeString("}\n")
+		}
+		if wildE := v.getEdgeKind(kWild); len(wildE) > 0 {
+			b.writef("return %d\n", wildE[len(wildE)-1].dst.n)
+		} else {
+			b.writeString("return -1\n")
+		}
+		b.writeString("\n},\n")
+	}
+	b.writeString("},\n")
+	if len(x.kid) > 0 {
+		b.writeString("nest: []dfa{")
+		for _, kid := range x.kid {
+			b.genDFAs(kid)
+		}
+		b.writeString("}")
+	}
+	b.writeString("},\n")
 }
 
-func inClass(r rune, lim []rune) bool {
-	for i := 0; i < len(lim); i += 2 {
-		if lim[i] <= r && r <= lim[i+1] {
-			return true
+func (b *Builder) tab(lvl int) {
+	for i := 0; i <= lvl; i++ {
+		b.writeByte('\t')
+	}
+}
+
+func (b *Builder) writeFamily(node *rule, lvl int) {
+	if node.startCode != "" {
+		b.writeStringWithReplace("if !yylex.stale {\n")
+		b.writeString("\t" + node.startCode + "\n")
+		b.writeString("}\n")
+	}
+	b.writef("OUTER%s%d:\n", node.id, lvl)
+	b.writefWithReplace("for { switch yylex.next(%v) {\n", lvl)
+	for i, x := range node.kid {
+		b.writef("\tcase %d:\n", i)
+		if x.kid != nil {
+			b.writeFamily(x, lvl+1)
+		} else {
+			b.writeString("\t" + x.code + "\n")
 		}
+	}
+	b.writeString("\tdefault:\n")
+	b.writef("\t\t break OUTER%s%d\n", node.id, lvl)
+	b.writeString("\t}\n")
+	b.writeString("}\n")
+	b.writef("yylex.pop()\n")
+	b.writeString(node.endCode + "\n")
+}
+
+func (b *Builder) writeLex(root rule) {
+	if !b.CustomError {
+		b.writeStringWithReplace(lexerErrorMethod)
+	}
+	b.writeStringWithReplace(lexerLexMethodIntro)
+	b.writeFamily(&root, 0)
+	b.writeString(lexerLexMethodOutro)
+}
+
+func (b *Builder) writeNNFun(root rule) {
+	b.writeStringWithReplace("func(yylex *Lexer) {\n")
+	b.writeFamily(&root, 0)
+	b.writeString("}")
+}
+
+func (b *Builder) read() bool {
+	var err error
+	b.r, _, err = b.in.ReadRune()
+	if err == io.EOF {
+		return true
+	}
+	b.err = err
+	if err != nil {
+		log.Fatal(err)
+	}
+	if b.r == '\n' {
+		b.lineno++
 	}
 	return false
 }
 
-var dfadot, nfadot *os.File
-
-func gen(out *bufio.Writer, x *rule) {
-	s := x.regex
-	// Regex -> NFA
-	// We cannot have our alphabet be all Unicode characters. Instead,
-	// we compute an alphabet for each regex:
-	//
-	//   1. Singles: we add single runes used in the regex: any rune not in a
-	//   range. These are held in `sing`.
-	//
-	//   2. Ranges: entire ranges become elements of the alphabet. If ranges in
-	//   the same expression overlap, we break them up into non-overlapping
-	//   ranges. The generated code checks singles before ranges, so there's no
-	//   need to break up a range if it contains a single. These are maintained
-	//   in sorted order in `lim`.
-	//
-	//   3. Wild: we add an element representing all other runes.
-	//
-	// e.g. the alphabet of /[0-9]*[Ee][2-5]*/ is sing: { E, e },
-	// lim: { [0-1], [2-5], [6-9] } and the wild element.
-	sing := make(map[rune]bool)
-	var lim []rune
-	var insertLimits func(l, r rune)
-	// Insert a new range [l-r] into `lim`, breaking it up if it overlaps, and
-	// discarding it if it coincides with an existing range. We keep `lim`
-	// sorted.
-	insertLimits = func(l, r rune) {
-		var i int
-		for i = 0; i < len(lim); i += 2 {
-			if l <= lim[i+1] {
-				break
-			}
-		}
-		if len(lim) == i || r < lim[i] {
-			lim = append(lim, 0, 0)
-			copy(lim[i+2:], lim[i:])
-			lim[i] = l
-			lim[i+1] = r
-			return
-		}
-		if l < lim[i] {
-			lim = append(lim, 0, 0)
-			copy(lim[i+2:], lim[i:])
-			lim[i+1] = lim[i] - 1
-			lim[i] = l
-			insertLimits(lim[i], r)
-			return
-		}
-		if l > lim[i] {
-			lim = append(lim, 0, 0)
-			copy(lim[i+2:], lim[i:])
-			lim[i+1] = l - 1
-			lim[i+2] = l
-			insertLimits(l, r)
-			return
-		}
-		// l == lim[i]
-		if r == lim[i+1] {
-			return
-		}
-		if r < lim[i+1] {
-			lim = append(lim, 0, 0)
-			copy(lim[i+2:], lim[i:])
-			lim[i] = l
-			lim[i+1] = r
-			lim[i+2] = r + 1
-			return
-		}
-		insertLimits(lim[i+1]+1, r)
-	}
-	pos := 0
-	n := 0
-	newNode := func() *node {
-		res := new(node)
-		res.n = n
-		n++
-		return res
-	}
-	newEdge := func(u, v *node) *edge {
-		res := new(edge)
-		res.dst = v
-		u.e = append(u.e, res)
-		sort.Sort(u.e)
-		return res
-	}
-	newStartEdge := func(u, v *node) *edge {
-		res := newEdge(u, v)
-		res.kind = kStart
-		return res
-	}
-	newEndEdge := func(u, v *node) *edge {
-		res := newEdge(u, v)
-		res.kind = kEnd
-		return res
-	}
-	newWildEdge := func(u, v *node) *edge {
-		res := newEdge(u, v)
-		res.kind = kWild
-		return res
-	}
-	newRuneEdge := func(u, v *node, r rune) *edge {
-		res := newEdge(u, v)
-		res.kind = kRune
-		res.r = r
-		sing[r] = true
-		return res
-	}
-	newNilEdge := func(u, v *node) *edge {
-		res := newEdge(u, v)
-		res.kind = kNil
-		return res
-	}
-	newClassEdge := func(u, v *node) *edge {
-		res := newEdge(u, v)
-		res.kind = kClass
-		res.lim = make([]rune, 0, 2)
-		return res
-	}
-	maybeEscape := func() rune {
-		c := s[pos]
-		if '\\' == c {
-			pos++
-			if len(s) == pos {
-				panic(ErrExtraneousBackslash)
-			}
-			c = s[pos]
-			switch {
-			case ispunct(c):
-			case escape(c) >= 0:
-				c = escape(s[pos])
-			default:
-				panic(ErrBadBackslash)
-			}
-		}
-		return c
-	}
-	pcharclass := func() (start, end *node) {
-		start, end = newNode(), newNode()
-		e := newClassEdge(start, end)
-		// Ranges consisting of a single element are a special case:
-		singletonRange := func(c rune) {
-			// 1. The edge-specific 'lim' field always expects endpoints in pairs,
-			// so we must give 'c' as the beginning and the end of the range.
-			e.lim = append(e.lim, c, c)
-			// 2. Instead of updating the regex-wide 'lim' interval set, we add a singleton.
-			sing[c] = true
-		}
-		if len(s) > pos && '^' == s[pos] {
-			e.negate = true
-			pos++
-		}
-		var left rune
-		leftLive := false
-		justSawDash := false
-		first := true
-		// Allow '-' at the beginning and end, and in ranges.
-		for pos < len(s) && s[pos] != ']' {
-			switch c := maybeEscape(); c {
-			case '-':
-				if first {
-					singletonRange('-')
-					break
-				}
-				justSawDash = true
-			default:
-				if justSawDash {
-					if !leftLive || left > c {
-						panic(ErrBadRange)
-					}
-					e.lim = append(e.lim, left, c)
-					if left == c {
-						sing[c] = true
-					} else {
-						insertLimits(left, c)
-					}
-					leftLive = false
-				} else {
-					if leftLive {
-						singletonRange(left)
-					}
-					left = c
-					leftLive = true
-				}
-				justSawDash = false
-			}
-			first = false
-			pos++
-		}
-		if leftLive {
-			singletonRange(left)
-		}
-		if justSawDash {
-			singletonRange('-')
-		}
-		return
-	}
-	isNested := false
-	var pre func() (start, end *node)
-	pterm := func() (start, end *node) {
-		if len(s) == pos || s[pos] == '|' {
-			end = newNode()
-			start = end
-			return
-		}
-		switch s[pos] {
-		case '*', '+', '?':
-			panic(ErrBareClosure)
-		case ')':
-			if !isNested {
-				panic(ErrUnmatchedRpar)
-			}
-			end = newNode()
-			start = end
-			return
-		case '(':
-			pos++
-			oldIsNested := isNested
-			isNested = true
-			start, end = pre()
-			isNested = oldIsNested
-			if len(s) == pos || ')' != s[pos] {
-				panic(ErrUnmatchedLpar)
-			}
-		case '.':
-			start, end = newNode(), newNode()
-			newWildEdge(start, end)
-		case '^':
-			start, end = newNode(), newNode()
-			newStartEdge(start, end)
-		case '$':
-			start, end = newNode(), newNode()
-			newEndEdge(start, end)
-		case ']':
-			panic(ErrUnmatchedRbkt)
-		case '[':
-			pos++
-			start, end = pcharclass()
-			if len(s) == pos || ']' != s[pos] {
-				panic(ErrUnmatchedLbkt)
-			}
-		default:
-			start, end = newNode(), newNode()
-			newRuneEdge(start, end, maybeEscape())
-		}
-		pos++
-		return
-	}
-	pclosure := func() (start, end *node) {
-		start, end = pterm()
-		if start == end {
-			return
-		}
-		if len(s) == pos {
-			return
-		}
-		switch s[pos] {
-		case '*':
-			newNilEdge(end, start)
-			nend := newNode()
-			newNilEdge(end, nend)
-			start, end = end, nend
-		case '+':
-			newNilEdge(end, start)
-			nend := newNode()
-			newNilEdge(end, nend)
-			end = nend
-		case '?':
-			nstart := newNode()
-			newNilEdge(nstart, start)
-			start = nstart
-			newNilEdge(start, end)
-		default:
-			return
-		}
-		pos++
-		return
-	}
-	pcat := func() (start, end *node) {
-		for {
-			nstart, nend := pclosure()
-			if start == nil {
-				start, end = nstart, nend
-			} else if nstart != nend {
-				end.e = make([]*edge, len(nstart.e))
-				copy(end.e, nstart.e)
-				end = nend
-			}
-			if nstart == nend {
-				return
-			}
+func (b *Builder) skipWs() bool {
+	for !b.read() {
+		if strings.IndexRune(" \n\t\r", b.r) == -1 {
+			return false
 		}
 	}
-	pre = func() (start, end *node) {
-		start, end = pcat()
-		for pos < len(s) && s[pos] != ')' {
-			if s[pos] != '|' {
-				panic(ErrInternal)
-			}
-			pos++
-			nstart, nend := pcat()
-			tmp := newNode()
-			newNilEdge(tmp, start)
-			newNilEdge(tmp, nstart)
-			start = tmp
-			tmp = newNode()
-			newNilEdge(end, tmp)
-			newNilEdge(nend, tmp)
-			end = tmp
-		}
-		return
-	}
-	start, end := pre()
-	end.accept = true
-
-	// Compute shortlist of nodes (reachable nodes), as we may have discarded
-	// nodes left over from parsing. Also, make short[0] the start node.
-	short := make([]*node, 0, n)
-	{
-		var visit func(*node)
-		mark := make([]bool, n)
-		newn := make([]int, n)
-		visit = func(u *node) {
-			mark[u.n] = true
-			newn[u.n] = len(short)
-			short = append(short, u)
-			for _, e := range u.e {
-				if !mark[e.dst.n] {
-					visit(e.dst)
-				}
-			}
-		}
-		visit(start)
-		for _, v := range short {
-			v.n = newn[v.n]
-		}
-	}
-	n = len(short)
-
-	if nfadot != nil {
-		writeDotGraph(nfadot, start, "NFA_"+x.id)
-	}
-
-	// NFA -> DFA
-	nilClose := func(st []bool) {
-		visited := make([]bool, n)
-		var do func(int)
-		do = func(i int) {
-			visited[i] = true
-			v := short[i]
-			for _, e := range v.e {
-				if e.kind == kNil && !visited[e.dst.n] {
-					st[e.dst.n] = true
-					do(e.dst.n)
-				}
-			}
-		}
-		for i := 0; i < n; i++ {
-			if st[i] && !visited[i] {
-				do(i)
-			}
-		}
-	}
-	var todo []*node
-	tab := make(map[string]*node)
-	var buf []byte
-	dfacount := 0
-	{ // Construct the node of no return.
-		for i := 0; i < n; i++ {
-			buf = append(buf, '0')
-		}
-		tmp := new(node)
-		tmp.n = -1
-		tab[string(buf)] = tmp
-	}
-	newDFANode := func(st []bool) (res *node, found bool) {
-		buf = nil
-		accept := false
-		for i, v := range st {
-			if v {
-				buf = append(buf, '1')
-				accept = accept || short[i].accept
-			} else {
-				buf = append(buf, '0')
-			}
-		}
-		res, found = tab[string(buf)]
-		if !found {
-			res = new(node)
-			res.n = dfacount
-			res.accept = accept
-			dfacount++
-			for i, v := range st {
-				if v {
-					res.set = append(res.set, i)
-				}
-			}
-			tab[string(buf)] = res
-		}
-		return res, found
-	}
-
-	get := func(states []bool) *node {
-		nilClose(states)
-		node, old := newDFANode(states)
-		if !old {
-			todo = append(todo, node)
-		}
-		return node
-	}
-	getcb := func(v *node, cb func(*edge) bool) *node {
-		states := make([]bool, n)
-		for _, i := range v.set {
-			for _, e := range short[i].e {
-				if cb(e) {
-					states[e.dst.n] = true
-				}
-			}
-		}
-		return get(states)
-	}
-	states := make([]bool, n)
-	// The DFA start state is the state representing the nil-closure of the start
-	// node in the NFA. Recall it has index 0.
-	states[0] = true
-	dfastart := get(states)
-	for len(todo) > 0 {
-		v := todo[len(todo)-1]
-		todo = todo[0 : len(todo)-1]
-		// Singles.
-		var runes []rune
-		for r, _ := range sing {
-			runes = append(runes, r)
-		}
-		sort.Sort(RuneSlice(runes))
-		for _, r := range runes {
-			newRuneEdge(v, getcb(v, func(e *edge) bool {
-				return e.kind == kRune && e.r == r ||
-					e.kind == kWild ||
-					e.kind == kClass && e.negate != inClass(r, e.lim)
-			}), r)
-		}
-		// Character ranges.
-		for j := 0; j < len(lim); j += 2 {
-			e := newClassEdge(v, getcb(v, func(e *edge) bool {
-				return e.kind == kWild ||
-					e.kind == kClass && e.negate != inClass(lim[j], e.lim)
-			}))
-
-			e.lim = append(e.lim, lim[j], lim[j+1])
-		}
-		// Wild.
-		newWildEdge(v, getcb(v, func(e *edge) bool {
-			return e.kind == kWild || (e.kind == kClass && e.negate)
-		}))
-		// ^ and $.
-		newStartEdge(v, getcb(v, func(e *edge) bool { return e.kind == kStart }))
-		newEndEdge(v, getcb(v, func(e *edge) bool { return e.kind == kEnd }))
-	}
-	n = dfacount
-
-	if dfadot != nil {
-		writeDotGraph(dfadot, dfastart, "DFA_"+x.id)
-	}
-	// DFA -> Go
-	sorted := make([]*node, n)
-	for _, v := range tab {
-		if -1 != v.n {
-			sorted[v.n] = v
-		}
-	}
-
-	fmt.Fprintf(out, "\n// %v\n", string(x.regex))
-	for i, v := range sorted {
-		if i == 0 {
-			out.WriteString("{[]bool{")
-		} else {
-			out.WriteString(", ")
-		}
-		if v.accept {
-			out.WriteString("true")
-		} else {
-			out.WriteString("false")
-		}
-	}
-	out.WriteString("}, []func(rune) int{  // Transitions\n")
-	for _, v := range sorted {
-		out.WriteString("func(r rune) int {\n")
-		var runeCases, classCases string
-		var wildDest int
-		for _, e := range v.e {
-			m := e.dst.n
-			switch e.kind {
-			case kRune:
-				runeCases += fmt.Sprintf("\t\tcase %d: return %d\n", e.r, m)
-			case kClass:
-				classCases += fmt.Sprintf("\t\tcase %d <= r && r <= %d: return %d\n",
-					e.lim[0], e.lim[1], m)
-			case kWild:
-				wildDest = m
-			}
-		}
-		if runeCases != "" {
-			out.WriteString("\tswitch(r) {\n" + runeCases + "\t}\n")
-		}
-		if classCases != "" {
-			out.WriteString("\tswitch {\n" + classCases + "\t}\n")
-		}
-		fmt.Fprintf(out, "\treturn %v\n},\n", wildDest)
-	}
-	out.WriteString("}, []int{  /* Start-of-input transitions */ ")
-	for _, v := range sorted {
-		s := " -1,"
-		for _, e := range v.e {
-			if e.kind == kStart {
-				s = fmt.Sprintf(" %d,", e.dst.n)
-				break
-			}
-		}
-		out.WriteString(s)
-	}
-	out.WriteString("}, []int{  /* End-of-input transitions */ ")
-	for _, v := range sorted {
-		s := " -1,"
-		for _, e := range v.e {
-			if e.kind == kEnd {
-				s = fmt.Sprintf(" %d,", e.dst.n)
-				break
-			}
-		}
-		out.WriteString(s)
-	}
-	out.WriteString("},")
-	if len(x.kid) == 0 {
-		out.WriteString("nil")
-	} else {
-		out.WriteString("[]dfa{")
-		for _, kid := range x.kid {
-			gen(out, kid)
-		}
-		out.WriteString("}")
-	}
-	out.WriteString("},\n")
+	return true
 }
 
-func writeFamily(out *bufio.Writer, node *rule, lvl int) {
-	tab := func() {
-		for i := 0; i <= lvl; i++ {
-			out.WriteByte('\t')
-		}
-	}
-	if node.startCode != "" {
-		tab()
-		prefixReplacer.WriteString(out, "if !yylex.stale {\n")
-		tab()
-		out.WriteString("\t" + node.startCode + "\n")
-		tab()
-		out.WriteString("}\n")
-	}
-	tab()
-	fmt.Fprintf(out, "OUTER%s%d:\n", node.id, lvl)
-	tab()
-	prefixReplacer.WriteString(out, fmt.Sprintf("for { switch yylex.next(%v) {\n", lvl))
-	for i, x := range node.kid {
-		tab()
-		fmt.Fprintf(out, "\tcase %d:\n", i)
-		lvl++
-		if x.kid != nil {
-			writeFamily(out, x, lvl)
-		} else {
-			tab()
-			out.WriteString("\t" + x.code + "\n")
-		}
-		lvl--
-	}
-	tab()
-	out.WriteString("\tdefault:\n")
-	tab()
-	fmt.Fprintf(out, "\t\t break OUTER%s%d\n", node.id, lvl)
-	tab()
-	out.WriteString("\t}\n")
-	tab()
-	out.WriteString("\tcontinue\n")
-	tab()
-	out.WriteString("}\n")
-	tab()
-	prefixReplacer.WriteString(out, "yylex.pop()\n")
-	tab()
-	out.WriteString(node.endCode + "\n")
-}
-
-func writeLex(out *bufio.Writer, root rule) {
-	if !customError {
-		prefixReplacer.WriteString(out, lexerErrorMethod)
-	}
-	prefixReplacer.WriteString(out, lexerLexMethodIntro)
-	writeFamily(out, &root, 0)
-	out.WriteString(lexerLexMethodOutro)
-}
-
-func writeNNFun(out *bufio.Writer, root rule) {
-	prefixReplacer.WriteString(out, "func(yylex *Lexer) {\n")
-	writeFamily(out, &root, 0)
-	out.WriteString("}")
-}
-
-func process(output io.Writer, input io.Reader) error {
-	lineno := 1
-	in := bufio.NewReader(input)
-	out := bufio.NewWriter(output)
-
-	out.WriteString("// Code generated by ")
-	out.WriteString(strings.Join(os.Args, " "))
-	out.WriteString(" --- DO NOT EDIT.\n\n")
-
-	var r rune
-	read := func() bool {
-		var err error
-		r, _, err = in.ReadRune()
-		if err == io.EOF {
-			return true
-		}
-		if err != nil {
-			panic(err)
-		}
-		if r == '\n' {
-			lineno++
-		}
-		return false
-	}
-	skipws := func() bool {
-		for !read() {
-			if strings.IndexRune(" \n\t\r", r) == -1 {
-				return false
-			}
-		}
-		return true
-	}
+func (b *Builder) readAll() string {
 	var buf []rune
-	readCode := func() string {
-		if '{' != r {
-			panic(ErrExpectedLBrace)
-		}
-		buf = []rune{r}
-		nesting := 1
-		for {
-			if read() {
-				panic(ErrUnmatchedLBrace)
-			}
-			buf = append(buf, r)
-			if '{' == r {
-				nesting++
-			} else if '}' == r {
-				nesting--
-				if 0 == nesting {
-					break
-				}
-			}
-		}
-		return string(buf)
+	for done := b.skipWs(); !done; done = b.read() {
+		buf = append(buf, b.r)
 	}
-	var root rule
-	needRootRAngle := false
-	var parse func(*rule) error
-	parse = func(node *rule) error {
-		for {
-			panicIf(skipws, ErrUnexpectedEOF)
-			if '<' == r {
-				if node != &root || len(node.kid) > 0 {
-					panic(ErrUnexpectedLAngle)
-				}
-				panicIf(skipws, ErrUnexpectedEOF)
-				node.startCode = readCode()
-				needRootRAngle = true
-				continue
-			} else if '>' == r {
-				if node == &root {
-					if !needRootRAngle {
-						panic(ErrUnmatchedRAngle)
-					}
-				}
-				if skipws() {
-					return ErrUnexpectedEOF
-				}
-				node.endCode = readCode()
-				return nil
-			}
-			delim := r
-			panicIf(read, ErrUnexpectedEOF)
-			var regex []rune
-			for {
-				if r == delim && (len(regex) == 0 || regex[len(regex)-1] != '\\') {
-					break
-				}
-				if '\n' == r {
-					return ErrUnexpectedNewline
-				}
-				regex = append(regex, r)
-				panicIf(read, ErrUnexpectedEOF)
-			}
-			if "" == string(regex) {
+	return string(buf)
+}
+
+func (b *Builder) readCode() string {
+	if '{' != b.r {
+		log.Fatal(ErrExpectedLBrace)
+	}
+	buf := []rune{b.r}
+	nesting := 1
+	for {
+		if b.read() {
+			log.Fatal(ErrUnmatchedLBrace)
+		}
+		buf = append(buf, b.r)
+		if '{' == b.r {
+			nesting++
+		} else if '}' == b.r {
+			nesting--
+			if 0 == nesting {
 				break
 			}
-			panicIf(skipws, ErrUnexpectedEOF)
-			x := new(rule)
-			x.id = fmt.Sprintf("%d", lineno)
-			node.kid = append(node.kid, x)
-			x.regex = make([]rune, len(regex))
-			copy(x.regex, regex)
-			if '<' == r {
-				panicIf(skipws, ErrUnexpectedEOF)
-				x.startCode = readCode()
-				parse(x)
-			} else {
-				x.code = readCode()
+		}
+	}
+	return string(buf)
+}
+
+func (b *Builder) parse(node *rule) error {
+	for {
+		mustFunc(b.skipWs, ErrUnexpectedEOF)
+		if '<' == b.r {
+			if node != &b.root || len(node.kid) > 0 {
+				log.Fatal(ErrUnexpectedLAngle)
 			}
+			mustFunc(b.skipWs, ErrUnexpectedEOF)
+			node.startCode = b.readCode()
+			b.needRootRAngle = true
+			continue
+		} else if '>' == b.r {
+			if node == &b.root {
+				if !b.needRootRAngle {
+					log.Fatal(ErrUnmatchedRAngle)
+				}
+			}
+			if b.skipWs() {
+				return ErrUnexpectedEOF
+			}
+			node.endCode = b.readCode()
+			return nil
 		}
-		return nil
-	}
-	err := parse(&root)
-	if err != nil {
-		return err
-	}
-
-	buf = nil
-	for done := skipws(); !done; done = read() {
-		buf = append(buf, r)
-	}
-	fs := token.NewFileSet()
-	// Append a blank line to make things easier when there are only package and
-	// import declarations.
-	t, err := parser.ParseFile(fs, "", string(buf)+"\n", parser.ImportsOnly)
-	if err != nil {
-		panic(err)
-	}
-	printer.Fprint(out, fs, t)
-
-	var file *token.File
-	fs.Iterate(func(f *token.File) bool {
-		file = f
-		return true
-	})
-
-	// Skip over package and import declarations. This is why we appended a blank
-	// line above.
-	for m := file.LineCount(); m > 1; m-- {
-		i := 0
-		for '\n' != buf[i] {
-			i++
+		delim := b.r
+		mustFunc(b.read, ErrUnexpectedEOF)
+		var regex []rune
+		for {
+			if b.r == delim && (len(regex) == 0 || regex[len(regex)-1] != '\\') {
+				break
+			}
+			if '\n' == b.r {
+				return ErrUnexpectedNewline
+			}
+			regex = append(regex, b.r)
+			mustFunc(b.read, ErrUnexpectedEOF)
 		}
-		buf = buf[i+1:]
-	}
-
-	prefixReplacer.WriteString(out, lexerIntro)
-
-	for _, kid := range root.kid {
-		gen(out, kid)
-	}
-
-	prefixReplacer.WriteString(out, lexerOutro)
-
-	if !standalone {
-		writeLex(out, root)
-		out.WriteString(string(buf))
-		out.Flush()
-		return nil
-	}
-	m := 0
-	const funmac = "NN_FUN"
-	for m < len(buf) {
-		m++
-		if funmac[:m] != string(buf[:m]) {
-			out.WriteString(string(buf[:m]))
-			buf = buf[m:]
-			m = 0
-		} else if funmac == string(buf[:m]) {
-			writeNNFun(out, root)
-			buf = buf[m:]
-			m = 0
+		if "" == string(regex) {
+			break
+		}
+		mustFunc(b.skipWs, ErrUnexpectedEOF)
+		x := new(rule)
+		x.id = fmt.Sprintf("%d", b.lineno)
+		node.kid = append(node.kid, x)
+		x.regex = make([]rune, len(regex))
+		copy(x.regex, regex)
+		if '<' == b.r {
+			mustFunc(b.skipWs, ErrUnexpectedEOF)
+			x.startCode = b.readCode()
+			// TODO: Why is this error ignored?
+			b.parse(x)
+		} else {
+			x.code = b.readCode()
 		}
 	}
-	out.WriteString(string(buf))
-	out.Flush()
 	return nil
 }
 
-func gofmt() error {
-	src, err := os.ReadFile(outFilename)
+func (b *Builder) Process(inputSource io.Reader) error {
+	b.in = bufio.NewReader(inputSource)
+	var outputBuffer bytes.Buffer
+	b.out = bufio.NewWriter(&outputBuffer)
+	b.lineno = 1
+	b.needRootRAngle = false
+	if b.CustomPrefix != "" {
+		b.replacer = strings.NewReplacer("yy", b.CustomPrefix)
+	}
+
+	if err := b.parse(&b.root); err != nil {
+		return err
+	}
+	userCode := b.readAll()
+
+	fs := token.NewFileSet()
+	// Append a blank line to make things easier when there are only package and import declarations.
+	t, err := parser.ParseFile(fs, "", userCode+"\n", parser.ImportsOnly)
 	if err != nil {
 		return err
 	}
-	src, err = format.Source(src)
+
+	b.writeString("// Code generated by ")
+	b.writeString(strings.Join(os.Args, " "))
+	b.writeString(" --- DO NOT EDIT.\n\n")
+	if err = printer.Fprint(b.out, fs, t); err != nil {
+		return err
+	}
+	b.writeStringWithReplace(lexerCode)
+
+	skipLineCount := 0
+	fs.Iterate(func(f *token.File) bool {
+		skipLineCount = f.LineCount() - 1
+		return true
+	})
+	// Skip over package and import declarations. This is why we appended a blank line above.
+	userCode = userCode[findNthLineIndex(userCode, skipLineCount):]
+
+	if !b.Standalone {
+		b.writeLex(b.root)
+	} else {
+		for i := strings.Index(userCode, funMacro); i >= 0; i = strings.Index(userCode, funMacro) {
+			b.writeString(userCode[:i])
+			b.writeNNFun(b.root)
+			userCode = userCode[i+len(funMacro):]
+		}
+	}
+
+	b.writeString(userCode)
+
+	// Write DFA states at the end of the file for readability.
+	b.writeString("var dfaStates = []dfa{")
+	for _, kid := range b.root.kid {
+		b.genDFAs(kid)
+	}
+	b.writeString("}")
+
+	b.flush()
+	if b.err != nil {
+		return b.err
+	}
+
+	b.Result.Lexer, err = formatCode(outputBuffer.Bytes())
 	if err != nil {
 		return err
 	}
-	err = os.WriteFile(outFilename, src, 0666)
+
+	return nil
+}
+
+func formatCode(src []byte) ([]byte, error) {
+	src, err := format.Source(src)
 	if err != nil {
-		return err
+		return src, err
 	}
-	r, err := goimports.New(outFilename)
-	if err != nil {
-		return err
-	}
-	return r.Run()
-}
-
-func panicIf(f func() bool, err error) {
-	if f() {
-		panic(err)
-	}
-}
-
-func dieIf(cond bool, v ...interface{}) {
-	if cond {
-		log.Fatal(v...)
-	}
-}
-
-func dieErr(err error, s string) {
-	if err != nil {
-		log.Fatalf("%v: %v", s, err)
-	}
-}
-
-func createDotFile(filename string) *os.File {
-	if filename == "" {
-		return nil
-	}
-	suf := strings.HasSuffix(filename, ".nex")
-	dieIf(suf, "nex: DOT filename ends with .nex:", filename)
-	file, err := os.Create(filename)
-	dieErr(err, "Create")
-	return file
+	return imports.Process("main.go", src, &imports.Options{
+		TabWidth:  8,
+		TabIndent: true,
+		Comments:  true,
+		Fragment:  true,
+	})
 }

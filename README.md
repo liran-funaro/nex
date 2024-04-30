@@ -2,18 +2,11 @@
 
 Nex is a lexer similar to Lex/Flex that:
 
-* generates Go code instead of C code
-* integrates with Go’s yacc instead of YACC/Bison
-* supports UTF-8
-* supports nested _structural regular expressions_.
-
-See 
-[Structural Regular Expressions][sre] 
-by Rob Pike. I wrote this code to get acquainted with Go
-and also to explore some of the ideas in the paper. Also, I’ve always been
-meaning to implement algorithms I learned from a compilers course I took many
-years ago. Back then, we never coded them; merely understanding the theory was
-enough to pass the exam.
+- generates Go code instead of C code
+- integrates with Go's yacc instead of YACC/Bison
+- supports UTF-8
+- supports nested _structural regular expressions_.
+  See  [Structural Regular Expressions][sre] by Rob Pike.
 
 Go has a less general [scanner package][scanner-package],
 but it is especially suited for tokenizing Go code.
@@ -33,6 +26,7 @@ similar in Nex:
 ```
 /\n/{ nLines++; nChars++ }
 /./{ nChars++ }
+//
 package main
 import ("fmt";"os")
 func main() {
@@ -72,13 +66,12 @@ or:
 $ nex -s lc.nex  # Writes code to lc.nn.go
 ```
 
-The `NN_FUN` macro is primitive, but I was unable to think of another way to
-achieve an Awk-esque feel. Purists unable to tolerate text substitution will
-need more code:
+Purists unable to tolerate text substitution using the `NN_FUN` will need more code:
 
 ```
 /\n/{ lval.l++; lval.c++ }
 /./{ lval.c++ }
+//
 package main
 import ("fmt";"os")
 type yySymType struct { l, c int }
@@ -96,9 +89,9 @@ $ nex lc.nex
 ```
 
 We could avoid defining a struct by using globals instead, but even then we
-need a throwaway definition of yySymType.
+need a throwaway definition of `yySymType`.
 
-The yy prefix can be modified by adding `-y` option. When using yacc, it must use the same prefix:
+The `yy` prefix can be modified by adding `-y` option. When using yacc, it must use the same prefix:
 
 ```shell
 $ nex -p YY lc.nex && go tool yacc -p YY && go run lc.nn.go y.go
@@ -119,7 +112,8 @@ modified Nex version, without string-to-number conversions:
 /\+|-|\*|\//      { println("An operator:", txt()) }
 /[ \t\n]+/        { /* eat up whitespace */ }
 /./               { println("Unrecognized character:", txt()) }
-/{**}/    { /** eat up one-line comments */ }
+/{[^\{\}\n]*}/    { /* eat up one-line comments */ }
+//
 package main
 import "os"
 func main() {
@@ -133,7 +127,7 @@ Enough simple examples! Let us see what nesting can do.
 
 ## Peter into silicon
 
-In ``Structural Regular Expressions'', Pike imagines a newline-agnostic Awk
+In [Structural Regular Expressions][sre], Pike imagines a newline-agnostic Awk
 that operates on matched text, rather than on the whole line containing a
 match, and writes code converting an input array of characters into
 descriptions of rectangles. For example, given an input such as:
@@ -176,6 +170,7 @@ The one-character-at-a-time variant:
 / /{ x++ }
 /#/{ println("rect", x, x+1, y, y+1); x++ }
 /\n/{ x=1; y++ }
+//
 package main
 import "os"
 func main() {
@@ -190,6 +185,7 @@ The one-run-at-a-time variant:
 / +/{ x+=len(txt()) }
 /#+/{ println("rect", x, x+len(txt()), y, y+1); x+=len(txt()) }
 /\n/{ x=1; y++ }
+//
 package main
 import "os"
 func main() {
@@ -209,10 +205,11 @@ editor commands to print all lines containing "rob" but not "robot". Though Nex
 fails to separate looping from matching, a corresponding program is bearable:
 
 ```
-/[^\n]*\n/ &lt; { isrobot = false; isrob = false }
+/[^\n]*\n/ < { isrobot = false; isrob = false }
   /robot/    { isrobot = true }
   /rob/      { isrob = true }
 >            { if isrob && !isrobot { fmt.print(lex.Text()) } }
+//
 package main
 import ("fmt";"os")
 func main() {
@@ -222,16 +219,16 @@ func main() {
 }
 ```
 
-The "&lt;" and ">" delimit nested expressions, and work as follows.
+The `<` and `>` delimit nested expressions, and work as follows.
 On reading a line, we find it matches the first regex, so we execute the code
-immediately following the opening "&lt;".
+immediately following the opening `<`.
 
-Then it’s as if we run Nex again, except we focus only on the patterns and
-actions up to the closing ">", with the matched line as the entire input. Thus
+Then it's as if we run Nex again, except we focus only on the patterns and
+actions up to the closing `>`, with the matched line as the entire input. Thus,
 we look for occurrences of "rob" and "robot" in just the matched line and set
 flags accordingly.
 
-After the line ends, we execute the code following the closing ">" and return
+After the line ends, we execute the code following the closing `>` and return
 to our original state, scanning for more lines.
 
 ## Word count
@@ -240,12 +237,13 @@ We can simultaneously count lines, words, and characters with Nex thanks to
 nesting:
 
 ```
-/[^\n]*\n/ &lt; {}
-  /[^ \t\r\n]*/ &lt; {}
+/[^\n]*\n/ < {}
+  /[^ \t\r\n]*/ < {}
     /./  { nChars++ }
   >      { nWords++ }
   /./    { nChars++ }
 >        { nLines++ }
+//
 package main
 import ("fmt";"os")
 func main() {
@@ -281,6 +279,7 @@ something like "one-hundred and fifty-three") into digits.
   fmt.Print([]rune(txt())[0] - rune('٠'))
 }
 /./ { fmt.Print(txt()) }
+//
 package main
 import ("fmt";"os")
 func zhToInt(s string) int {
@@ -364,6 +363,7 @@ Call the above `rp.y`. Then a suitable lexer, say `rp.nex`, might be:
 /[ \t]/  { /* Skip blanks and tabs. */ }
 /[0-9]*/ { lval.n,_ = strconv.Atoi(yylex.Text()); return NUM }
 /./ { return int(yylex.Text()[0]) }
+//
 package main
 import ("os";"strconv")
 func main() {
@@ -381,12 +381,12 @@ For brevity, we work in the `main` package. In a larger project we might want
 to write a package that exports a function wrapped around `yyParse()`. This is
 fine, provided the parser and the lexer are both in the same package.
 
-Alternatively, we could use yacc’s `-p` option to change the prefix from `yy`
+Alternatively, we could use yacc's `-p` option to change the prefix from `yy`
 to one that begins with an uppercase letter.
 
 ## Matching the beginning and end of input
 
-We can simulate awk’s BEGIN and END blocks with a regex that matches the entire
+We can simulate awk's BEGIN and END blocks with a regex that matches the entire
 input:
 
 ```
@@ -408,6 +408,7 @@ this problem, Nex supports the following syntax:
 <      { println("BEGIN") }
   /a/  { println("a") }
 >      { println("END") }
+//
 package main
 import "os"
 func main() {
@@ -415,23 +416,20 @@ func main() {
 }
 ```
 
-In other words, if a bare '&lt;' appears as the first pattern, then its action is
+In other words, if a bare `<` appears as the first pattern, then its action is
 executed before reading the input. The last pattern must be a bare '>', and its
 action is executed on end of input.
 
 Additionally, no empty regex is needed to mark the beginning of the Go program.
-(Fortunately, an empty regex is also a Go comment, so there’s no harm done if
-present.)
+Fortunately, an empty regex is also a Go comment, so there's no harm done if
+present.
 
 ## Matching Nuances
 
 Among rules in the same scope, the longest matching pattern takes precedence.
 In event of a tie, the first pattern wins.
 
-Un-anchored patterns never match the empty string. For example,
-
-    /(foo)*/ {}
-
+Un-anchored patterns never match the empty string. For example, `/(foo)*/ {}`
 matches "foo" and "foofoo", but not "".
 
 Anchored patterns can match the empty string at most once; after the match, the
@@ -441,7 +439,7 @@ Internally, this is implemented by omitting the very first check to see if the
 current state is accepted when running the DFA corresponding to the regex. An
 alternative would be to simply ignore matches of length 0, but I chose to allow
 anchored empty matches just in case there turn out to be applications for them.
-I’m open to changing this behaviour.
+I'm open to changing this behaviour.
 
 ## Contributing and Testing
 
@@ -453,27 +451,35 @@ git clone https://github.com/liran-funaro/nex.git
 
 ## Reference
 
-    func NewLexer(in io.Reader) *Lexer
+```go
+func NewLexer(in io.Reader) *Lexer
 
-    // NewLexerWithInit creates a new Lexer object, runs the given callback on it,
-    // then returns it.
-    func NewLexerWithInit(in io.Reader, initFun func(*Lexer)) *Lexer
+// NewLexerWithInit creates a new Lexer object, runs the given callback on it,
+// then returns it.
+func NewLexerWithInit(in io.Reader, initFun func(*Lexer)) *Lexer
 
-    // Lex runs the lexer. Always returns 0.
-    // When the -s option is given, this function is not generated;
-    // instead, the NN_FUN macro runs the lexer.
-	func (yylex *Lexer) Lex(lval *yySymType) int
+// Lex runs the lexer. Always returns 0.
+// When the -s option is given, this function is not generated;
+// instead, the NN_FUN macro runs the lexer.
+func (yylex *Lexer) Lex(lval *yySymType) int
 
-    // Text returns the matched text.
-    func (yylex *Lexer) Text() string
+// Text returns the matched text.
+func (yylex *Lexer) Text() string
 
-    // Line returns the current line number.
-    // The first line is 0.
-    func (yylex *Lexer) Line() int
+// Line returns the current line number.
+// The first line is 0.
+func (yylex *Lexer) Line() int
 
-    // Column returns the current column number.
-    // The first column is 0.
-    func (yylex *Lexer) Column() int
+// Column returns the current column number.
+// The first column is 0.
+func (yylex *Lexer) Column() int
+```
+
+# Note from the Original Author
+
+I wrote this code to get acquainted with Go and also to explore some of the ideas in the paper.
+Also, I've always been meaning to implement algorithms I learned from a compilers course I took many years ago.
+Back then, we never coded them; merely understanding the theory was enough to pass the exam.
 
 [sre]: http://doc.cat-v.org/bell_labs/structural_regexps/se.pdf
 [scanner-package]: http://golang.org/pkg/scanner/

@@ -6,6 +6,7 @@ import (
 	"io"
 	"os"
 	"os/exec"
+	"path"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -13,44 +14,56 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
-var nexBin string
-
-func init() {
+func getNexBin(t *testing.T) string {
 	var err error
 	try := []string{
 		filepath.Join(os.Getenv("GOPATH"), "bin", "nex"),
 		filepath.Join("..", "nex"),
 		"nex", // look in all of PATH
 	}
-	for _, path := range try {
-		if path, err = exec.LookPath(path); err != nil {
+	for _, testPath := range try {
+		if testPath, err = exec.LookPath(testPath); err != nil {
 			continue
 		}
-		if path, err = filepath.Abs(path); err != nil {
-			panic(fmt.Sprintf("cannot get absolute path to nex binary: %s", err))
+		if testPath, err = filepath.Abs(testPath); err != nil {
+			t.Fatalf("cannot get absolute testPath to nex binary: %s", err)
 		}
-		nexBin = path
-		return
+		require.NoError(t, os.Setenv("NEXBIN", testPath))
+		return testPath
 	}
-	panic("cannot find nex binary")
+	t.Fatal("cannot find nex binary")
+	return ""
 }
 
-//go:embed rp-input.txt
+func copyToDir(t *testing.T, dst, src string) {
+	dst = filepath.Join(dst, filepath.Base(src))
+	s, err := os.Open(src)
+	require.NoError(t, err)
+	defer func() { require.NoError(t, s.Close()) }()
+	d, err := os.Create(dst)
+	require.NoError(t, err)
+	defer func() { require.NoError(t, d.Close()) }()
+	_, err = io.Copy(d, s)
+	require.NoError(t, err)
+}
+
+//go:embed test-data/rp-input.txt
 var rpInput string
 
-//go:embed rp-output.txt
+//go:embed test-data/rp-output.txt
 var rpOutput string
 
 // Test the reverse-Polish notation calculator rp.{nex,y}.
 func TestNexPlusYacc(t *testing.T) {
+	nexBin := getNexBin(t)
 	tmpdir := t.TempDir()
 	run := func(s string) {
 		v := strings.Split(s, " ")
-		err := exec.Command(v[0], v[1:]...).Run()
-		require.NoError(t, err, s)
+		output, err := exec.Command(v[0], v[1:]...).CombinedOutput()
+		require.NoErrorf(t, err, "Command: %s\nOutput: %s\n", s, string(output))
 	}
-	copyToDir(t, tmpdir, "rp.nex")
-	copyToDir(t, tmpdir, "rp.y")
+	copyToDir(t, tmpdir, path.Join("test-data", "rp.nex"))
+	copyToDir(t, tmpdir, path.Join("test-data", "rp.y"))
 	wd, err := os.Getwd()
 	require.NoError(t, err, "Getwd")
 	require.NoError(t, os.Chdir(tmpdir), "Chdir")
@@ -69,25 +82,26 @@ func TestNexPlusYacc(t *testing.T) {
 	}
 }
 
-//go:embed toy-input.txt
+//go:embed test-data/toy-input.txt
 var toyInput string
 
-//go:embed toy-output.txt
+//go:embed test-data/toy-output.txt
 var toyOutput string
 
-//go:embed robo-input.txt
+//go:embed test-data/robo-input.txt
 var roboInput string
 
-//go:embed robo-output.txt
+//go:embed test-data/robo-output.txt
 var roboOutput string
 
-//go:embed peter-input.txt
+//go:embed test-data/peter-input.txt
 var peterInput string
 
-//go:embed peter-output.txt
+//go:embed test-data/peter-output.txt
 var peterOutput string
 
 func TestNexPrograms(t *testing.T) {
+	nexBin := getNexBin(t)
 	for i, x := range []struct {
 		prog, in, out string
 	}{
@@ -110,7 +124,7 @@ func TestNexPrograms(t *testing.T) {
 	} {
 		t.Run(x.prog, func(t *testing.T) {
 			t.Parallel()
-			cmd := exec.Command(nexBin, "-r", "-s", x.prog)
+			cmd := exec.Command(nexBin, "-r", "-s", path.Join("test-data", x.prog))
 			cmd.Stdin = strings.NewReader(x.in)
 			got, err := cmd.CombinedOutput()
 			require.NoError(t, err, fmt.Sprintf("program (%d): %s\ngot: %s\n", i, x.prog, string(got)))
@@ -123,6 +137,7 @@ func TestNexPrograms(t *testing.T) {
 
 // To save time, we combine several test cases into a single nex program.
 func TestGiantProgram(t *testing.T) {
+	nexBin := getNexBin(t)
 	tmpdir := t.TempDir()
 	wd, err := os.Getwd()
 	require.NoError(t, err, "Getwd")
@@ -282,14 +297,35 @@ func Go() {
 	require.NoError(t, err, string(output))
 }
 
-func copyToDir(t *testing.T, dst, src string) {
-	dst = filepath.Join(dst, filepath.Base(src))
-	s, err := os.Open(src)
-	require.NoError(t, err)
-	defer func() { require.NoError(t, s.Close()) }()
-	d, err := os.Create(dst)
-	require.NoError(t, err)
-	defer func() { require.NoError(t, d.Close()) }()
-	_, err = io.Copy(d, s)
-	require.NoError(t, err)
+//go:embed test-data/tacky/input.txt
+var testTackyInput string
+
+//go:embed test-data/tacky/output.txt
+var testTackyOutput string
+
+func TestWax(t *testing.T) {
+	getNexBin(t)
+	tmpdir := t.TempDir()
+	for _, f := range []string{"tacky.nex", "tacky.y", "tacky.go", "build.sh"} {
+		copyToDir(t, tmpdir, path.Join("test-data", "tacky", f))
+	}
+	require.NoError(t, os.Chmod(path.Join(tmpdir, "build.sh"), 0777))
+
+	run := func(s string) {
+		v := strings.Split(s, " ")
+		output, err := exec.Command(v[0], v[1:]...).CombinedOutput()
+		require.NoError(t, err, fmt.Sprintf("cmd: %s\noutput: %s\n", s, output))
+	}
+	wd, err := os.Getwd()
+	require.NoError(t, err, "Getwd")
+	require.NoError(t, os.Chdir(tmpdir), "Chdir")
+	defer func() {
+		require.NoError(t, os.Chdir(wd), "Chdir")
+	}()
+	run("./build.sh")
+	cmd := exec.Command("./tacky")
+	cmd.Stdin = strings.NewReader(testTackyInput)
+	got, err := cmd.CombinedOutput()
+	require.NoError(t, err, "CombinedOutput")
+	require.Equal(t, testTackyOutput, string(got))
 }
