@@ -1,4 +1,4 @@
-module nex
+module github.com/liran-funaro/nex
 
 go 1.22.0
 
