@@ -1,0 +1,14 @@
+/(?i)a{2,5}/ { a++ }
+/(?i)b{3}/ { b++ }
+/(?i)c{3,}/ { c++ }
+/(?i)d+/ { d++ }
+/(?i)(efg|e)/ { e++ }
+/(?i)[a-z]+/ {}
+//
+package main
+import ("fmt";"os")
+func main() {
+  var a, b, c, d, e int
+  NN_FUN(NewLexer(os.Stdin))
+  fmt.Printf("a:%d\nb:%d\nc:%d\nd:%d\ne:%d\n", a, b, c, d, e)
+}

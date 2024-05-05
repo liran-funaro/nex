@@ -1,4 +1,3 @@
-// Package nex has substantial copy-and-paste from src/pkg/regexp.
 package nex
 
 import (
@@ -20,34 +19,15 @@ import (
 	"golang.org/x/tools/imports"
 )
 
-var (
-	ErrInternal            = errors.New("internal error")
-	ErrUnmatchedLpar       = errors.New("unmatched '('")
-	ErrUnmatchedRpar       = errors.New("unmatched ')'")
-	ErrUnmatchedLbkt       = errors.New("unmatched '['")
-	ErrUnmatchedRbkt       = errors.New("unmatched ']'")
-	ErrBadRange            = errors.New("bad range in character class")
-	ErrExtraneousBackslash = errors.New("extraneous backslash")
-	ErrBareClosure         = errors.New("closure applies to nothing")
-	ErrBadBackslash        = errors.New("illegal backslash escape")
-	ErrExpectedLBrace      = errors.New("expected '{'")
-	ErrUnmatchedLBrace     = errors.New("unmatched '{'")
-	ErrUnexpectedEOF       = errors.New("unexpected EOF")
-	ErrUnexpectedNewline   = errors.New("unexpected newline")
-	ErrUnexpectedLAngle    = errors.New("unexpected '<'")
-	ErrUnmatchedLAngle     = errors.New("unmatched '<'")
-	ErrUnmatchedRAngle     = errors.New("unmatched '>'")
+const funMacro = "NN_FUN"
 
-	escapeMap = map[rune]rune{
-		'a': '\a',
-		'b': '\b',
-		'f': '\f',
-		'n': '\n',
-		'r': '\r',
-		't': '\t',
-		'v': '\v',
-	}
-	punctuationMarks = "!\"#$%&'()*+,-./:;<=>?@[\\]^_`{|}~"
+var (
+	ErrExpectedLBrace    = errors.New("expected '{'")
+	ErrUnmatchedLBrace   = errors.New("unmatched '{'")
+	ErrUnexpectedEOF     = errors.New("unexpected EOF")
+	ErrUnexpectedNewline = errors.New("unexpected newline")
+	ErrUnexpectedLAngle  = errors.New("unexpected '<'")
+	ErrUnmatchedRAngle   = errors.New("unmatched '>'")
 
 	lexerCode, lexerLexMethodIntro, lexerLexMethodOutro, lexerErrorMethod = lexerText()
 )
@@ -72,19 +52,8 @@ func lexerText() (string, string, string, string) {
 	return s[1], s[2], s[3], s[4]
 }
 
-func ispunct(c rune) bool {
-	return strings.ContainsRune(punctuationMarks, c)
-}
-
-func escape(c rune) rune {
-	if b, ok := escapeMap[c]; ok {
-		return b
-	}
-	return -1
-}
-
 type rule struct {
-	regex     []rune
+	regex     string
 	code      string
 	startCode string
 	endCode   string
@@ -170,7 +139,10 @@ func (b *Builder) writefWithReplace(format string, a ...any) {
 
 func (b *Builder) genDFAs(x *rule) {
 	// Regex -> NFA
-	nfaGraph := BuildNfa(x)
+	nfaGraph, err := BuildNfa(x)
+	if err != nil {
+		log.Fatal(err)
+	}
 	b.Result.NfaDot = dumpDotGraph(nfaGraph.Start, "NFA_"+x.id)
 
 	// NFA -> DFA
@@ -178,49 +150,91 @@ func (b *Builder) genDFAs(x *rule) {
 	b.Result.DfaDot = dumpDotGraph(dfaGraph.Start, "DFA_"+x.id)
 
 	// DFA -> Go
-	b.writef("\n{ // %v\n acc: []bool{", string(x.regex))
-	for _, v := range dfaGraph.Nodes {
-		b.writef("%t,", v.accept)
-	}
-	b.writeString("},\n startf: []int{")
-	for _, v := range dfaGraph.Nodes {
-		if e := v.getEdgeKind(kStart); len(e) > 0 {
-			b.writef("%d,", e[0].dst.n)
-		} else {
-			b.writeString("-1,")
+	b.writef("\n{ // %v\n acc: map[int]bool{", x.regex)
+	for i, v := range dfaGraph.Nodes {
+		if v.accept {
+			b.writef("%d:%t,", i, v.accept)
 		}
 	}
-	b.writeString("},\n endf: []int{")
-	for _, v := range dfaGraph.Nodes {
-		if e := v.getEdgeKind(kEnd); len(e) > 0 {
-			b.writef("%d,", e[0].dst.n)
-		} else {
-			b.writeString("-1,")
+	b.writeString("},\n")
+
+	m := map[int]int{}
+	for i, v := range dfaGraph.Nodes {
+		if e := v.getEdgeKind(kStart); len(e) > 0 && e[0].dst.id >= 0 {
+			m[i] = e[0].dst.id
 		}
 	}
-	b.writeString("},\n f: []func(rune) int{\n")
-	for _, v := range dfaGraph.Nodes {
-		b.writeString("func(r rune) int {\n")
-		if runeE := v.getEdgeKind(kRune); len(runeE) > 0 {
-			b.writeString("switch(r) {\n")
-			for _, e := range runeE {
-				b.writef("case %q: return %d\n", e.r, e.dst.n)
-			}
-			b.writeString("}\n")
+	if len(m) > 0 {
+		b.writeString("startf: map[int]int{")
+		for i, dst := range m {
+			b.writef("%d:%d,", i, dst)
 		}
-		if classE := v.getEdgeKind(kClass); len(classE) > 0 {
-			b.writeString("switch {\n")
-			for _, e := range classE {
-				b.writef("case %q <= r && r <= %q: return %d\n", e.lim[0], e.lim[1], e.dst.n)
-			}
-			b.writeString("}\n")
+		b.writeString("},\n")
+	}
+
+	m = map[int]int{}
+	for i, v := range dfaGraph.Nodes {
+		if e := v.getEdgeKind(kEnd); len(e) > 0 && e[0].dst.id >= 0 {
+			m[i] = e[0].dst.id
 		}
+	}
+	if len(m) > 0 {
+		b.writeString("endf: map[int]int{")
+		for i, dst := range m {
+			b.writef("%d:%d,", i, dst)
+		}
+		b.writeString("},\n")
+	}
+
+	b.writeString("f: []func(rune) int{\n")
+	for i, v := range dfaGraph.Nodes {
+		b.writef("func(r rune) int { // State %d\n", i)
+		wildDst := -1
 		if wildE := v.getEdgeKind(kWild); len(wildE) > 0 {
-			b.writef("return %d\n", wildE[len(wildE)-1].dst.n)
-		} else {
-			b.writeString("return -1\n")
+			wildDst = wildE[0].dst.id
 		}
-		b.writeString("\n},\n")
+
+		if runeE := v.getEdgeKind(kRune); len(runeE) > 0 {
+			m := map[int][]string{}
+			for _, e := range runeE {
+				if e.dst.id == wildDst {
+					continue
+				}
+				m[e.dst.id] = append(m[e.dst.id], fmt.Sprintf("%q", e.r))
+			}
+			if len(m) > 0 {
+				b.writeString("switch(r) {\n")
+				for ret, caseValue := range m {
+					b.writef("case %s: return %d\n", strings.Join(caseValue, ","), ret)
+				}
+				b.writeString("}\n")
+			}
+		}
+
+		if classE := v.getEdgeKind(kClass); len(classE) > 0 {
+			m := map[int][]string{}
+			for _, e := range classE {
+				if e.dst.id == wildDst {
+					continue
+				}
+				m[e.dst.id] = append(m[e.dst.id], fmt.Sprintf("%q <= r && r <= %q", e.lim[0], e.lim[1]))
+			}
+			if len(m) > 0 {
+				b.writeString("switch {\n")
+				for ret, caseValue := range m {
+					if len(caseValue) > 1 {
+						for i, c := range caseValue {
+							caseValue[i] = fmt.Sprintf("(%s)", c)
+						}
+					}
+					b.writef("case %s: return %d\n", strings.Join(caseValue, " || "), ret)
+				}
+				b.writeString("}\n")
+			}
+		}
+
+		b.writef("return %d\n", wildDst)
+		b.writeString("},\n")
 	}
 	b.writeString("},\n")
 	if len(x.kid) > 0 {
@@ -278,6 +292,7 @@ func (b *Builder) writeNNFun(root rule) {
 	b.writeString("}")
 }
 
+// read returns true if reached EOF
 func (b *Builder) read() bool {
 	var err error
 	b.r, _, err = b.in.ReadRune()
@@ -294,6 +309,7 @@ func (b *Builder) read() bool {
 	return false
 }
 
+// skipWs returns true if reached EOF
 func (b *Builder) skipWs() bool {
 	for !b.read() {
 		if strings.IndexRune(" \n\t\r", b.r) == -1 {
@@ -374,16 +390,13 @@ func (b *Builder) parse(node *rule) error {
 			break
 		}
 		mustFunc(b.skipWs, ErrUnexpectedEOF)
-		x := new(rule)
-		x.id = fmt.Sprintf("%d", b.lineno)
+		x := &rule{id: fmt.Sprintf("%d", b.lineno)}
 		node.kid = append(node.kid, x)
-		x.regex = make([]rune, len(regex))
-		copy(x.regex, regex)
+		x.regex = string(regex)
 		if '<' == b.r {
 			mustFunc(b.skipWs, ErrUnexpectedEOF)
 			x.startCode = b.readCode()
-			// TODO: Why is this error ignored?
-			b.parse(x)
+			NoError(b.parse(x), "sub-parse")
 		} else {
 			x.code = b.readCode()
 		}

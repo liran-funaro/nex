@@ -100,6 +100,12 @@ var peterInput string
 //go:embed test-data/peter-output.txt
 var peterOutput string
 
+//go:embed test-data/garbage-input.txt
+var garbageInput string
+
+//go:embed test-data/garbage-output.txt
+var garbageOutput string
+
 func TestNexPrograms(t *testing.T) {
 	nexBin := getNexBin(t)
 	for i, x := range []struct {
@@ -115,6 +121,8 @@ func TestNexPrograms(t *testing.T) {
 		{"wc.nex", "1\na b\nA B C\n", "3 6 12\n"},
 		{"wc.nex", "one two three\nfour five six\n", "2 6 28\n"},
 
+		{"garbage.nex", garbageInput, garbageOutput},
+
 		{"rob.nex", roboInput, roboOutput},
 
 		{"peter.nex", peterInput, peterOutput},
@@ -128,9 +136,7 @@ func TestNexPrograms(t *testing.T) {
 			cmd.Stdin = strings.NewReader(x.in)
 			got, err := cmd.CombinedOutput()
 			require.NoError(t, err, fmt.Sprintf("program (%d): %s\ngot: %s\n", i, x.prog, string(got)))
-			if string(got) != x.out {
-				t.Fatalf("program: %s\nwant %q, got %q", x.prog, x.out, string(got))
-			}
+			require.Equalf(t, x.out, string(got), "program: %s", x.prog)
 		})
 	}
 }
@@ -284,8 +290,8 @@ func Go() {
   }
 }
 `), 0777), "WriteFile")
-		_, cerr := exec.Command(nexBin, "-o", filepath.Join("nex_test"+id, "tmp.go"), id+".nex").CombinedOutput()
-		require.NoError(t, cerr, "nex: "+s)
+		out, cErr := exec.Command(nexBin, "-o", filepath.Join("nex_test"+id, "tmp.go"), id+".nex").CombinedOutput()
+		require.NoErrorf(t, cErr, "nex: %s\nout: %s\n", s, out)
 		body += "nex_test" + id + ".Go()\n"
 	}
 	s += "func main() {\n" + body + "}\n"

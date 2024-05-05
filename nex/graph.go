@@ -15,25 +15,26 @@ const (
 	kWild
 	kStart
 	kEnd
-
-	funMacro = "NN_FUN"
 )
 
 type edge struct {
-	kind   int           // Rune/Class/Wild/Nil.
-	r      rune          // Rune for rune edges.
-	lim    charTypeEdges // Pairs of limits for character class edges.
-	negate bool          // True if the character class is negated.
-	dst    *node         // Destination node.
+	kind int           // Rune/Class/Wild/Nil.
+	r    rune          // Rune for rune edges.
+	lim  charTypeEdges // Pairs of limits for character class edges.
+	dst  *node         // Destination node.
 }
 
 func edgeCompare(a, b *edge) int {
 	return int(a.r - b.r)
 }
 
+type graphBuilder struct {
+	nextId int
+}
+
 type node struct {
 	e      []*edge // Out-edges.
-	n      int     // Index number. Scoped to a family.
+	id     int     // Index number. Scoped to a family.
 	accept bool    // True if this is an accepting state.
 	set    []int   // The NFA nodes represented by a DFA node.
 }
@@ -57,6 +58,12 @@ func (n *node) getEdgeKind(kind int) []*edge {
 		}
 	}
 	return res
+}
+
+func (g *graphBuilder) newNode() *node {
+	n := &node{id: g.nextId}
+	g.nextId++
+	return n
 }
 
 func newEdge(u, v *node) *edge {
@@ -88,9 +95,7 @@ func newNilEdge(u, v *node) *edge {
 	return newKindEdge(u, v, kNil)
 }
 func newClassEdge(u, v *node) *edge {
-	res := newKindEdge(u, v, kClass)
-	res.lim = make([]rune, 0, 2)
-	return res
+	return newKindEdge(u, v, kClass)
 }
 
 func newRuneEdge(u, v *node, r rune) *edge {
@@ -99,25 +104,23 @@ func newRuneEdge(u, v *node, r rune) *edge {
 	return res
 }
 
-func compactGraphInner(n *node, mark map[int]bool) []*node {
-	var nodes []*node
-
-	mark[n.n] = true
-	nodes = append(nodes, n)
-	for _, e := range n.e {
-		if !mark[e.dst.n] {
-			nodes = append(nodes, compactGraphInner(e.dst, mark)...)
+func compactGraph(start *node) []*node {
+	visited := map[int]bool{}
+	nodes := []*node{start}
+	for pos := 0; pos < len(nodes); pos++ {
+		n := nodes[pos]
+		for _, e := range n.e {
+			if !visited[e.dst.id] {
+				visited[e.dst.id] = true
+				nodes = append(nodes, e.dst)
+			}
 		}
 	}
 
-	return nodes
-}
-
-func compactGraph(n *node) []*node {
-	nodes := compactGraphInner(n, make(map[int]bool))
 	for i, v := range nodes {
-		v.n = i
+		v.id = i
 	}
+
 	return nodes
 }
 
@@ -147,12 +150,12 @@ type dotGraphBuilder struct {
 
 func (b *dotGraphBuilder) show(u *node) {
 	if u.accept {
-		_, _ = fmt.Fprintf(b.out, "  %v[style=filled,color=green];\n", u.n)
+		_, _ = fmt.Fprintf(b.out, "  %v[style=filled,color=green];\n", u.id)
 	}
 	b.done[u] = true
 	for _, e := range u.e {
 		// We use -1 to denote the dead end node in DFAs.
-		if e.dst.n == -1 {
+		if e.dst.id == -1 {
 			continue
 		}
 		label := ""
@@ -169,9 +172,6 @@ func (b *dotGraphBuilder) show(u *node) {
 			label = "[color=blue]"
 		case kClass:
 			label = "[label=\"["
-			if e.negate {
-				label += "^"
-			}
 			for i := 0; i < len(e.lim); i += 2 {
 				label += runeToDot(e.lim[i])
 				if e.lim[i] != e.lim[i+1] {
@@ -180,7 +180,7 @@ func (b *dotGraphBuilder) show(u *node) {
 			}
 			label += "]\"]"
 		}
-		_, _ = fmt.Fprintf(b.out, "  %v -> %v%v;\n", u.n, e.dst.n, label)
+		_, _ = fmt.Fprintf(b.out, "  %v -> %v%v;\n", u.id, e.dst.id, label)
 	}
 	for _, e := range u.e {
 		if !b.done[e.dst] {

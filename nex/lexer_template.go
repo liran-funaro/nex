@@ -85,9 +85,9 @@ type frame struct {
 }
 
 type dfa struct {
-	acc          []bool           // Accepting states.
+	acc          map[int]bool     // Accepting states.
 	f            []func(rune) int // Transitions.
-	startf, endf []int            // Transitions at start and end of input.
+	startf, endf map[int]int      // Transitions at start and end of input.
 	nest         []dfa
 }
 
@@ -134,15 +134,18 @@ func (s *scanner) scan(in *bufio.Reader) {
 
 	var states []state
 	for i, f := range s.family {
-		mark := make([]bool, len(f.startf))
+		mark := make(map[int]bool)
 		// Every DFA starts at state 0.
 		st := 0
 		for {
 			states = append(states, state{i, st})
 			mark[st] = true
 			// As we're at the start of input, follow all ^ transitions and append to our list of start states.
-			st = f.startf[st]
-			if -1 == st || mark[st] {
+			ok := false
+			if f.startf != nil {
+				st, ok = f.startf[st]
+			}
+			if !ok || -1 == st || mark[st] {
 				break
 			}
 			// We only check for a match after at least one transition.
@@ -181,11 +184,15 @@ func (s *scanner) scan(in *bufio.Reader) {
 		} else {
 		dollar: // Handle $.
 			for _, x := range states {
-				mark := make([]bool, len(s.family[x.dfaIndex].endf))
+				mark := make(map[int]bool)
 				for {
 					mark[x.stateIndex] = true
-					x.stateIndex = s.family[x.dfaIndex].endf[x.stateIndex]
-					if -1 == x.stateIndex || mark[x.stateIndex] {
+					ok := false
+					endf := s.family[x.dfaIndex].endf
+					if endf != nil {
+						x.stateIndex, ok = s.family[x.dfaIndex].endf[x.stateIndex]
+					}
+					if !ok || -1 == x.stateIndex || mark[x.stateIndex] {
 						break
 					}
 					if s.checkStateAccept(x) {

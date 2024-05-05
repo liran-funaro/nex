@@ -2,7 +2,6 @@ package nex
 
 // Dfa - DFA: Deterministic Finite Automaton
 type Dfa struct {
-	Nfa   *Nfa
 	Nodes []*node
 	Start *node
 }
@@ -23,129 +22,131 @@ func BuildDfa(nfa *Nfa) *Dfa {
 	dfaStart := b.get(states)
 	for len(b.todo) > 0 {
 		v := b.todo[len(b.todo)-1]
-		b.todo = b.todo[0 : len(b.todo)-1]
+		b.todo = b.todo[:len(b.todo)-1]
 		// Singles.
 		for _, r := range nfa.Singles {
 			newRuneEdge(v, b.getCb(v, func(e *edge) bool {
-				return e.kind == kRune && e.r == r ||
-					e.kind == kWild ||
-					e.kind == kClass && e.negate != e.lim.inClass(r)
+				return (e.kind == kRune && e.r == r) || e.kind == kWild || (e.kind == kClass && e.lim.inClass(r))
 			}), r)
 		}
 		// Character ranges.
 		for j := 0; j < len(nfa.Lim); j += 2 {
 			e := newClassEdge(v, b.getCb(v, func(e *edge) bool {
-				return e.kind == kWild ||
-					e.kind == kClass && e.negate != e.lim.inClass(nfa.Lim[j])
+				return e.kind == kWild || (e.kind == kClass && e.lim.inClass(nfa.Lim[j]))
 			}))
-
-			e.lim = append(e.lim, nfa.Lim[j], nfa.Lim[j+1])
+			e.lim = []rune{nfa.Lim[j], nfa.Lim[j+1]}
 		}
 		// Wild.
 		newWildEdge(v, b.getCb(v, func(e *edge) bool {
-			return e.kind == kWild || (e.kind == kClass && e.negate)
+			return e.kind == kWild
 		}))
 		// ^ and $.
 		newStartEdge(v, b.getCb(v, func(e *edge) bool { return e.kind == kStart }))
 		newEndEdge(v, b.getCb(v, func(e *edge) bool { return e.kind == kEnd }))
 	}
 
-	sorted := make([]*node, b.n)
+	sorted := make([]*node, b.nextId)
 	for _, v := range b.tab {
-		if -1 != v.n {
-			sorted[v.n] = v
+		if -1 != v.id {
+			sorted[v.id] = v
 		}
 	}
 
 	return &Dfa{
-		Nfa:   nfa,
-		Nodes: sorted,
 		Start: dfaStart,
+		Nodes: sorted,
 	}
 }
 
 type dfaBuilder struct {
+	graphBuilder
 	nfa  *Nfa
-	n    int
 	tab  map[string]*node
 	todo []*node
 }
 
-func (b *dfaBuilder) nilClose(st []bool) {
-	visited := make([]bool, len(b.nfa.Nodes))
-	var do func(int)
-	do = func(i int) {
-		visited[i] = true
-		v := b.nfa.Nodes[i]
-		for _, e := range v.e {
-			if e.kind == kNil && !visited[e.dst.n] {
-				st[e.dst.n] = true
-				do(e.dst.n)
-			}
+func stToSet(st []bool) []int {
+	var set []int
+	for i, v := range st {
+		if v {
+			set = append(set, i)
 		}
 	}
-	for i := 0; i < len(b.nfa.Nodes); i++ {
-		if st[i] && !visited[i] {
-			do(i)
+	return set
+}
+
+func makeStKey(st []bool) string {
+	buf := make([]rune, len(st))
+	for i, v := range st {
+		if v {
+			buf[i] = '1'
+		} else {
+			buf[i] = '0'
+		}
+	}
+	return string(buf)
+}
+
+// nilClose adds all nil steps to the state list
+func (b *dfaBuilder) nilClose(st []bool) {
+	bfs := stToSet(st)
+	visited := make([]bool, len(b.nfa.Nodes))
+	for len(bfs) > 0 {
+		i := bfs[0]
+		bfs = bfs[1:]
+		visited[i] = true
+		for _, e := range b.nfa.Nodes[i].e {
+			if e.kind == kNil && !visited[e.dst.id] {
+				st[e.dst.id] = true
+				bfs = append(bfs, e.dst.id)
+			}
 		}
 	}
 }
 
-func (b *dfaBuilder) newDFANode(st []bool) (res *node, found bool) {
-	var buf []byte
-	accept := false
+func (b *dfaBuilder) stToAccept(st []bool) bool {
 	for i, v := range st {
-		if v {
-			buf = append(buf, '1')
-			accept = accept || b.nfa.Nodes[i].accept
-		} else {
-			buf = append(buf, '0')
+		if v && b.nfa.Nodes[i].accept {
+			return true
 		}
 	}
-	res, found = b.tab[string(buf)]
+	return false
+}
+
+func (b *dfaBuilder) newDFANode(st []bool) (res *node, found bool) {
+	key := makeStKey(st)
+	res, found = b.tab[key]
 	if !found {
-		res = new(node)
-		res.n = b.n
-		res.accept = accept
-		b.n++
-		for i, v := range st {
-			if v {
-				res.set = append(res.set, i)
-			}
-		}
-		b.tab[string(buf)] = res
+		res = b.newNode()
+		res.set = stToSet(st)
+		res.accept = b.stToAccept(st)
+		b.tab[key] = res
 	}
 	return res, found
 }
 
-func (b *dfaBuilder) get(states []bool) *node {
-	b.nilClose(states)
-	newNode, isOld := b.newDFANode(states)
+func (b *dfaBuilder) get(st []bool) *node {
+	b.nilClose(st)
+	nNode, isOld := b.newDFANode(st)
 	if !isOld {
-		b.todo = append(b.todo, newNode)
+		b.todo = append(b.todo, nNode)
 	}
-	return newNode
+	return nNode
 }
 
 // constructEndNode Construct the node of no return.
 func (b *dfaBuilder) constructEndNode() {
-	var buf []byte
-	for i := 0; i < len(b.nfa.Nodes); i++ {
-		buf = append(buf, '0')
-	}
-	tmp := new(node)
-	tmp.n = -1
-	b.tab[string(buf)] = tmp
+	b.tab[makeStKey(make([]bool, len(b.nfa.Nodes)))] = &node{id: -1}
 }
 
 func (b *dfaBuilder) getCb(v *node, cb func(*edge) bool) *node {
-	states := make([]bool, len(b.nfa.Nodes))
+	st := make([]bool, len(b.nfa.Nodes))
 	for _, i := range v.set {
 		for _, e := range b.nfa.Nodes[i].e {
-			if cb(e) {
-				states[e.dst.n] = true
+			if !st[e.dst.id] {
+				st[e.dst.id] = cb(e)
 			}
 		}
 	}
-	return b.get(states)
+	return b.get(st)
 }

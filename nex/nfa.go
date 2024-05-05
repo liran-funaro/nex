@@ -1,17 +1,17 @@
 package nex
 
 import (
-	"log"
+	"fmt"
+	"regexp/syntax"
 	"slices"
 )
 
 // Nfa - NFA: Nondeterministic Finite Automaton
 type Nfa struct {
-	Regexp  []rune
+	Start   *node
 	Nodes   []*node
 	Lim     []rune
 	Singles []rune
-	Start   *node
 }
 
 // BuildNfa Regex -> NFA
@@ -31,42 +31,38 @@ type Nfa struct {
 //
 // e.g. the alphabet of /[0-9]*[Ee][2-5]*/ is singles: { E, e },
 // lim: { [0-1], [2-5], [6-9] } and the wild element.
-func BuildNfa(x *rule) *Nfa {
-	b := nfaBuilder{
-		regexp:  x.regex,
-		singles: make(map[rune]bool),
+func BuildNfa(x *rule) (*Nfa, error) {
+	r, err := syntax.Parse(x.regex, syntax.Perl)
+	if err != nil {
+		return nil, err
 	}
 
-	start, end := b.pRe()
-	end.accept = true
-
-	// Compute shortlist of nodes (reachable nodes), as we may have discarded
-	// nodes left over from parsing. Also, make short[0] the start node.
-	b.nodes = compactGraph(start)
+	b := nfaBuilder{singles: make(map[rune]bool)}
+	nfa := b.build(r)
+	nfa.end.accept = true
 
 	return &Nfa{
-		Regexp:  x.regex,
-		Nodes:   b.nodes,
+		Start: nfa.start,
+		// Compute shortlist of nodes (reachable nodes), as we may have discarded
+		// nodes left over from parsing. Also, make short[0] the start node.
+		Nodes:   compactGraph(nfa.start),
 		Lim:     b.lim,
 		Singles: b.getSortedSingles(),
-		Start:   start,
-	}
+	}, nil
 }
 
 type nfaBuilder struct {
-	regexp   []rune
-	lim      []rune
-	singles  map[rune]bool
-	pos      int
-	n        int
-	isNested bool
-	nodes    []*node
+	graphBuilder
+	lim     []rune
+	singles map[rune]bool
 }
 
-func (b *nfaBuilder) newNode() *node {
-	res := &node{n: b.n}
-	b.n++
-	return res
+type subNfa struct {
+	start, end *node
+}
+
+func (b *nfaBuilder) newSubNfa() subNfa {
+	return subNfa{start: b.newNode(), end: b.newNode()}
 }
 
 func (b *nfaBuilder) getSortedSingles() []rune {
@@ -125,201 +121,129 @@ func (b *nfaBuilder) insertLimits(l, r rune) {
 	b.insertLimits(b.lim[i+1]+1, r)
 }
 
-func (b *nfaBuilder) maybeEscape() rune {
-	c := b.regexp[b.pos]
-	if '\\' == c {
-		b.pos++
-		if len(b.regexp) == b.pos {
-			log.Fatal(ErrExtraneousBackslash)
-		}
-		c = b.regexp[b.pos]
-		switch {
-		case ispunct(c):
-		case escape(c) >= 0:
-			c = escape(b.regexp[b.pos])
-		default:
-			log.Fatal(ErrBadBackslash)
-		}
-	}
-	return c
-}
-
-func (b *nfaBuilder) pCharClass() (start, end *node) {
-	start, end = b.newNode(), b.newNode()
-	e := newClassEdge(start, end)
-	// Ranges consisting of a single element are a special case:
-	singletonRange := func(c rune) {
-		// 1. The edge-specific 'lim' field always expects endpoints in pairs,
-		// so we must give 'c' as the beginning and the end of the range.
-		e.lim = append(e.lim, c, c)
-		// 2. Instead of updating the regex-wide 'lim' interval set, we add a singleton.
-		b.singles[c] = true
-	}
-	if len(b.regexp) > b.pos && '^' == b.regexp[b.pos] {
-		e.negate = true
-		b.pos++
-	}
-	var left rune
-	leftLive := false
-	justSawDash := false
-	first := true
-	// Allow '-' at the beginning and end, and in ranges.
-	for b.pos < len(b.regexp) && b.regexp[b.pos] != ']' {
-		switch c := b.maybeEscape(); c {
-		case '-':
-			if first {
-				singletonRange('-')
-				break
+func (b *nfaBuilder) build(r *syntax.Regexp) subNfa {
+	switch r.Op {
+	case syntax.OpNoMatch: // matches no strings
+		panic("OpNoMatch is not implemented")
+	case syntax.OpEmptyMatch: // matches empty string
+		nfa := b.newSubNfa()
+		newNilEdge(nfa.start, nfa.end)
+		return nfa
+	case syntax.OpLiteral: // matches Runes sequence
+		start := b.newNode()
+		curStart := start
+		for _, curRune := range r.Rune {
+			n := b.newNode()
+			newRuneEdge(curStart, n, curRune)
+			b.singles[curRune] = true
+			if r.Flags&syntax.FoldCase != 0 && curRune >= 'A' && curRune <= 'Z' {
+				curRune += 'a' - 'A'
+				newRuneEdge(curStart, n, curRune)
+				b.singles[curRune] = true
 			}
-			justSawDash = true
-		default:
-			if justSawDash {
-				if !leftLive || left > c {
-					log.Fatal(ErrBadRange)
-				}
-				e.lim = append(e.lim, left, c)
-				if left == c {
-					b.singles[c] = true
-				} else {
-					b.insertLimits(left, c)
-				}
-				leftLive = false
+			curStart = n
+		}
+		return subNfa{start, curStart}
+	case syntax.OpCharClass: // matches Runes interpreted as range pair list
+		nfa := b.newSubNfa()
+		e := newClassEdge(nfa.start, nfa.end)
+		e.lim = r.Rune
+		for i := 0; i < len(r.Rune); i += 2 {
+			if r.Rune[i] == r.Rune[i+1] {
+				b.singles[r.Rune[i]] = true
 			} else {
-				if leftLive {
-					singletonRange(left)
-				}
-				left = c
-				leftLive = true
+				b.insertLimits(r.Rune[i], r.Rune[i+1])
 			}
-			justSawDash = false
 		}
-		first = false
-		b.pos++
-	}
-	if leftLive {
-		singletonRange(left)
-	}
-	if justSawDash {
-		singletonRange('-')
-	}
-	return
-}
-
-func (b *nfaBuilder) pTerm() (start, end *node) {
-	if len(b.regexp) == b.pos || b.regexp[b.pos] == '|' {
-		end = b.newNode()
-		start = end
-		return
-	}
-	switch b.regexp[b.pos] {
-	case '*', '+', '?':
-		log.Fatal(ErrBareClosure)
-	case ')':
-		if !b.isNested {
-			log.Fatal(ErrUnmatchedRpar)
-		}
-		end = b.newNode()
-		start = end
-		return
-	case '(':
-		b.pos++
-		oldIsNested := b.isNested
-		b.isNested = true
-		start, end = b.pRe()
-		b.isNested = oldIsNested
-		if len(b.regexp) == b.pos || ')' != b.regexp[b.pos] {
-			log.Fatal(ErrUnmatchedLpar)
-		}
-	case '.':
-		start, end = b.newNode(), b.newNode()
-		newWildEdge(start, end)
-	case '^':
-		start, end = b.newNode(), b.newNode()
-		newStartEdge(start, end)
-	case '$':
-		start, end = b.newNode(), b.newNode()
-		newEndEdge(start, end)
-	case ']':
-		log.Fatal(ErrUnmatchedRbkt)
-	case '[':
-		b.pos++
-		start, end = b.pCharClass()
-		if len(b.regexp) == b.pos || ']' != b.regexp[b.pos] {
-			log.Fatal(ErrUnmatchedLbkt)
-		}
-	default:
-		start, end = b.newNode(), b.newNode()
-		r := b.maybeEscape()
-		newRuneEdge(start, end, r)
-		b.singles[r] = true
-	}
-	b.pos++
-	return
-}
-
-func (b *nfaBuilder) pClosure() (start, end *node) {
-	start, end = b.pTerm()
-	if start == end {
-		return
-	}
-	if len(b.regexp) == b.pos {
-		return
-	}
-	switch b.regexp[b.pos] {
-	case '*':
-		newNilEdge(end, start)
+		return nfa
+	case syntax.OpAnyCharNotNL: // matches any character except newline
+		fallthrough
+	case syntax.OpAnyChar: // matches any character
+		nfa := b.newSubNfa()
+		newWildEdge(nfa.start, nfa.end)
+		return nfa
+	case syntax.OpBeginLine: // matches empty string at beginning of line
+		nfa := b.newSubNfa()
+		newStartEdge(nfa.start, nfa.end)
+		return nfa
+	case syntax.OpEndLine: // matches empty string at end of line
+		nfa := b.newSubNfa()
+		newEndEdge(nfa.start, nfa.end)
+		return nfa
+	case syntax.OpBeginText: // matches empty string at beginning of text
+		nfa := b.newSubNfa()
+		newStartEdge(nfa.start, nfa.end)
+		return nfa
+	case syntax.OpEndText: // matches empty string at end of text
+		nfa := b.newSubNfa()
+		newEndEdge(nfa.start, nfa.end)
+		return nfa
+	case syntax.OpWordBoundary: // matches word boundary `\b`
+		panic("OpWordBoundary is not implemented")
+	case syntax.OpNoWordBoundary: // matches word non-boundary `\B`
+		panic("OpNoWordBoundary is not implemented")
+	case syntax.OpCapture: // capturing subexpression with index Cap, optional name Name
+		return b.build(r.Sub[0])
+	case syntax.OpPlus: // matches Sub[0] one or more times
+		nfa := b.build(r.Sub[0])
+		newNilEdge(nfa.end, nfa.start)
 		nEnd := b.newNode()
-		newNilEdge(end, nEnd)
-		start, end = end, nEnd
-	case '+':
-		newNilEdge(end, start)
+		newNilEdge(nfa.end, nEnd)
+		nfa.end = nEnd
+		return nfa
+	case syntax.OpStar: // matches Sub[0] zero or more times
+		nfa := b.build(r.Sub[0])
+		newNilEdge(nfa.end, nfa.start)
 		nEnd := b.newNode()
-		newNilEdge(end, nEnd)
-		end = nEnd
-	case '?':
+		newNilEdge(nfa.end, nEnd)
+		nfa.start, nfa.end = nfa.end, nEnd
+		return nfa
+	case syntax.OpQuest: // matches Sub[0] zero or one times
+		nfa := b.build(r.Sub[0])
 		nStart := b.newNode()
-		newNilEdge(nStart, start)
-		start = nStart
-		newNilEdge(start, end)
-	default:
-		return
-	}
-	b.pos++
-	return
-}
-
-func (b *nfaBuilder) pCat() (start, end *node) {
-	for {
-		nStart, nEnd := b.pClosure()
-		if start == nil {
-			start, end = nStart, nEnd
-		} else if nStart != nEnd {
-			end.e = make([]*edge, len(nStart.e))
-			copy(end.e, nStart.e)
-			end = nEnd
+		newNilEdge(nStart, nfa.start)
+		nfa.start = nStart
+		newNilEdge(nfa.start, nfa.end)
+		return nfa
+	case syntax.OpRepeat: // matches Sub[0] at least Min times, at most Max (Max == -1 is no limit)
+		nfa := b.newSubNfa()
+		lastNfa := &nfa
+		prevEnd := nfa.start
+		for i := 0; i < r.Min; i++ {
+			rNfa := b.build(r.Sub[0])
+			newNilEdge(prevEnd, rNfa.start)
+			prevEnd = rNfa.end
+			lastNfa = &rNfa
 		}
-		if nStart == nEnd {
-			return
+		newNilEdge(prevEnd, nfa.end)
+		if r.Max < 0 {
+			newNilEdge(prevEnd, lastNfa.start)
+			return nfa
 		}
-	}
-}
-
-func (b *nfaBuilder) pRe() (start, end *node) {
-	start, end = b.pCat()
-	for b.pos < len(b.regexp) && b.regexp[b.pos] != ')' {
-		if b.regexp[b.pos] != '|' {
-			log.Fatal(ErrInternal)
+		for i := 0; i < (r.Max - r.Min); i++ {
+			rNfa := b.build(r.Sub[0])
+			newNilEdge(prevEnd, rNfa.start)
+			newNilEdge(rNfa.end, nfa.end)
+			prevEnd = rNfa.end
 		}
-		b.pos++
-		nStart, nEnd := b.pCat()
-		tmp := b.newNode()
-		newNilEdge(tmp, start)
-		newNilEdge(tmp, nStart)
-		start = tmp
-		tmp = b.newNode()
-		newNilEdge(end, tmp)
-		newNilEdge(nEnd, tmp)
-		end = tmp
+		return nfa
+	case syntax.OpConcat: // matches concatenation of Subs
+		start := b.newNode()
+		curStart := start
+		for _, s := range r.Sub {
+			nfa := b.build(s)
+			newNilEdge(curStart, nfa.start)
+			curStart = nfa.end
+		}
+		return subNfa{start, curStart}
+	case syntax.OpAlternate: // matches alternation of Subs
+		nfa := b.newSubNfa()
+		for _, s := range r.Sub {
+			sNfa := b.build(s)
+			newNilEdge(nfa.start, sNfa.start)
+			newNilEdge(sNfa.end, nfa.end)
+		}
+		return nfa
 	}
-	return
+	panic(fmt.Sprintf("Unreconized op: '%d'", r.Op))
 }
