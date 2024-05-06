@@ -31,21 +31,25 @@ type Nfa struct {
 //
 // e.g. the alphabet of /[0-9]*[Ee][2-5]*/ is singles: { E, e },
 // lim: { [0-1], [2-5], [6-9] } and the wild element.
-func BuildNfa(x *rule) (*Nfa, error) {
-	r, err := syntax.Parse(x.regex, syntax.Perl)
-	if err != nil {
-		return nil, err
+func BuildNfa(root *rule) (*Nfa, error) {
+	b := nfaBuilder{singles: make(map[rune]bool)}
+	rootNode := b.newNode()
+
+	for _, x := range root.kid {
+		r, err := syntax.Parse(x.regex, syntax.Perl)
+		if err != nil {
+			return nil, err
+		}
+		sNfa := b.build(r)
+		sNfa.end.accept = x.id
+		newNilEdge(rootNode, sNfa.start)
 	}
 
-	b := nfaBuilder{singles: make(map[rune]bool)}
-	nfa := b.build(r)
-	nfa.end.accept = true
-
 	return &Nfa{
-		Start: nfa.start,
+		Start: rootNode,
 		// Compute shortlist of nodes (reachable nodes), as we may have discarded
 		// nodes left over from parsing. Also, make short[0] the start node.
-		Nodes:   compactGraph(nfa.start),
+		Nodes:   compactGraph(rootNode),
 		Lim:     b.lim,
 		Singles: b.getSortedSingles(),
 	}, nil

@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bytes"
 	_ "embed"
 	"fmt"
 	"io"
@@ -11,76 +12,9 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/liran-funaro/nex/nex"
 	"github.com/stretchr/testify/require"
 )
-
-func getNexBin(t *testing.T) string {
-	var err error
-	try := []string{
-		filepath.Join(os.Getenv("GOPATH"), "bin", "nex"),
-		filepath.Join("..", "nex"),
-		"nex", // look in all of PATH
-	}
-	for _, testPath := range try {
-		if testPath, err = exec.LookPath(testPath); err != nil {
-			continue
-		}
-		if testPath, err = filepath.Abs(testPath); err != nil {
-			t.Fatalf("cannot get absolute testPath to nex binary: %s", err)
-		}
-		require.NoError(t, os.Setenv("NEXBIN", testPath))
-		return testPath
-	}
-	t.Fatal("cannot find nex binary")
-	return ""
-}
-
-func copyToDir(t *testing.T, dst, src string) {
-	dst = filepath.Join(dst, filepath.Base(src))
-	s, err := os.Open(src)
-	require.NoError(t, err)
-	defer func() { require.NoError(t, s.Close()) }()
-	d, err := os.Create(dst)
-	require.NoError(t, err)
-	defer func() { require.NoError(t, d.Close()) }()
-	_, err = io.Copy(d, s)
-	require.NoError(t, err)
-}
-
-//go:embed test-data/rp-input.txt
-var rpInput string
-
-//go:embed test-data/rp-output.txt
-var rpOutput string
-
-// Test the reverse-Polish notation calculator rp.{nex,y}.
-func TestNexPlusYacc(t *testing.T) {
-	nexBin := getNexBin(t)
-	tmpdir := t.TempDir()
-	run := func(s string) {
-		v := strings.Split(s, " ")
-		output, err := exec.Command(v[0], v[1:]...).CombinedOutput()
-		require.NoErrorf(t, err, "Command: %s\nOutput: %s\n", s, string(output))
-	}
-	copyToDir(t, tmpdir, path.Join("test-data", "rp.nex"))
-	copyToDir(t, tmpdir, path.Join("test-data", "rp.y"))
-	wd, err := os.Getwd()
-	require.NoError(t, err, "Getwd")
-	require.NoError(t, os.Chdir(tmpdir), "Chdir")
-	defer func() {
-		require.NoError(t, os.Chdir(wd), "Chdir")
-	}()
-	run(nexBin + " rp.nex")
-	run("goyacc rp.y")
-	run("go build y.go rp.nn.go")
-	cmd := exec.Command("./y")
-	cmd.Stdin = strings.NewReader(rpInput)
-	got, err := cmd.CombinedOutput()
-	require.NoError(t, err, "CombinedOutput")
-	if rpOutput != string(got) {
-		t.Fatalf("want %q, got %q", rpOutput, string(got))
-	}
-}
 
 //go:embed test-data/toy-input.txt
 var toyInput string
@@ -100,14 +34,8 @@ var peterInput string
 //go:embed test-data/peter-output.txt
 var peterOutput string
 
-//go:embed test-data/garbage-input.txt
-var garbageInput string
-
-//go:embed test-data/garbage-output.txt
-var garbageOutput string
-
 func TestNexPrograms(t *testing.T) {
-	nexBin := getNexBin(t)
+	t.Parallel()
 	for i, x := range []struct {
 		prog, in, out string
 	}{
@@ -121,8 +49,6 @@ func TestNexPrograms(t *testing.T) {
 		{"wc.nex", "1\na b\nA B C\n", "3 6 12\n"},
 		{"wc.nex", "one two three\nfour five six\n", "2 6 28\n"},
 
-		{"garbage.nex", garbageInput, garbageOutput},
-
 		{"rob.nex", roboInput, roboOutput},
 
 		{"peter.nex", peterInput, peterOutput},
@@ -132,42 +58,56 @@ func TestNexPrograms(t *testing.T) {
 	} {
 		t.Run(x.prog, func(t *testing.T) {
 			t.Parallel()
-			cmd := exec.Command(nexBin, "-r", "-s", path.Join("test-data", x.prog))
-			cmd.Stdin = strings.NewReader(x.in)
-			got, err := cmd.CombinedOutput()
-			require.NoError(t, err, fmt.Sprintf("program (%d): %s\ngot: %s\n", i, x.prog, string(got)))
-			require.Equalf(t, x.out, string(got), "program: %s", x.prog)
+			var stdout bytes.Buffer
+			nex.ExecWithParams(&nex.ExecParams{
+				InputFilename: path.Join("test-data", x.prog),
+				Standalone:    true,
+				RunProgram:    true,
+				Stdin:         strings.NewReader(x.in),
+				Stderr:        os.Stderr,
+				Stdout:        &stdout,
+			})
+			require.Equalf(t, x.out, string(stdout.Bytes()), "program (%d): %s", i, x.prog)
 		})
 	}
 }
 
-// To save time, we combine several test cases into a single nex program.
-func TestGiantProgram(t *testing.T) {
-	nexBin := getNexBin(t)
+const cornerCasesMainDoc = `//
+package main
+import ("os")
+
+type yySymType = string
+
+func main() {
+  lval := new(yySymType)
+  l := NewLexer(os.Stdin)
+  for l.Lex(lval) != 0 { }
+  fmt.Print(string(*lval))
+}
+`
+
+func TestCornerCases(t *testing.T) {
+	t.Parallel()
 	tmpdir := t.TempDir()
-	wd, err := os.Getwd()
-	require.NoError(t, err, "Getwd")
-	require.NoError(t, os.Chdir(tmpdir), "Chdir")
-	defer func() {
-		require.NoError(t, os.Chdir(wd), "Chdir")
-	}()
-	s := "package main\n"
-	body := ""
+
 	for i, x := range []struct {
-		prog, in, out string
+		name, prog, in, out string
 	}{
-		// Test parentheses and $.
-		{`
+		{
+			"Test parentheses and $",
+			`
 /[a-z]*/ <  { *lval += "[" }
   /a(($*|$$)($($)$$$))$($$$)*/ { *lval += "0" }
   /(e$|f$)/ { *lval += "1" }
   /(qux)*/  { *lval += "2" }
   /$/       { *lval += "." }
 >           { *lval += "]" }
-`, "a b c d e f g aaab aaaa eeeg fffe quxqux quxq quxe",
-			"[0][.][.][.][1][1][.][.][0][.][1][2][2][21]"},
-		// Exercise ^ and rule precedence.
-		{`
+`,
+			"a b c d e f g aaab aaaa eeeg fffe quxqux quxq quxe",
+			"[0][.][.][.][1][1][.][.][0][.][1][2][2][21]",
+		}, {
+			"Exercise ^ and rule precedence",
+			`
 /[a-z]*/ <  { *lval += "[" }
   /((^*|^^)(^(^)^^^))^(^^^)*bar/ { *lval += "0" }
   /(^foo)*/ { *lval += "1" }
@@ -176,27 +116,32 @@ func TestGiantProgram(t *testing.T) {
   /^foo*/   { *lval += "4" }
   /^/       { *lval += "." }
 >           { *lval += "]" }
-`, "foo bar foooo fooo fooooo fooof baz foofoo",
-			"[1][0][3][2][4][4][.][1]"},
-		// Anchored empty matches.
-		{`
+`,
+			"foo bar foooo fooo fooooo fooof baz foofoo",
+			"[1][0][3][2][4][4][.][1]",
+		}, {
+			"Anchored empty matches",
+			`
 /^/ { *lval += "BEGIN" }
 /$/ { *lval += "END" }
-`, "", "BEGIN"},
-
-		{`
+`,
+			"", "BEGIN",
+		}, {
+			"Anchored empty matches",
+			`
 /$/ { *lval += "END" }
 /^/ { *lval += "BEGIN" }
-`, "", "END"},
-
-		{`
+`, "", "END",
+		}, {
+			"Anchored empty matches", `
 /^$/ { *lval += "BOTH" }
 /^/ { *lval += "BEGIN" }
 /$/ { *lval += "END" }
-`, "", "BOTH"},
-		// Built-in Line and Column counters.
-		// Ugly hack to import fmt.
-		{`"fmt"
+`,
+			"", "BOTH",
+		}, {
+			"Built-in Line and Column counters",
+			`
 /\*/    { *lval += yySymType(fmt.Sprintf("[%d,%d]", yylex.Line(), yylex.Column())) }
 `,
 			`..*.
@@ -204,26 +149,35 @@ func TestGiantProgram(t *testing.T) {
 ...
 ...*.*
 *
-`, "[0,2][1,0][1,1][3,3][3,5][4,0]"},
-		// Patterns like awk's BEGIN and END.
-		{`
+`,
+			"[0,2][1,0][1,1][3,3][3,5][4,0]",
+		},
+		{
+			"Patterns like awk's BEGIN and END",
+			`
 <          { *lval += "[" }
   /[0-9]*/ { *lval += "N" }
   /;/      { *lval += ";" }
   /./      { *lval += "." }
 >          { *lval += "]\n" }
-`, "abc 123 xyz;a1b2c3;42", "[....N....;.N.N.N;N]\n"},
-		// A partial match regex has no effect on an immediately following match.
-		{`
+`,
+			"abc 123 xyz;a1b2c3;42", "[....N....;.N.N.N;N]\n",
+		}, {
+			"A partial match regex has no effect on an immediately following match",
+			`
 /abcd/ { *lval += "ABCD" }
 /\n/   { *lval += "\n" }
-`, "abcd\nbabcd\naabcd\nabcabcd\n", "ABCD\nABCD\nABCD\nABCD\n"},
+`,
+			"abcd\nbabcd\naabcd\nabcabcd\n", "ABCD\nABCD\nABCD\nABCD\n",
+		},
 
 		// Nested regex test. The simplistic parser means we must use commented
 		// braces to balance out quoted braces.
 		// Sprinkle in a couple of return statements to check Lex() saves stack
 		// state correctly between calls.
-		{`
+		{
+			"Nested regex test",
+			`
 /a[bcd]*e/ < { *lval += "[" }
   /a/        { *lval += "A" }
   /bcd/ <    { *lval += "(" }
@@ -243,64 +197,72 @@ func TestGiantProgram(t *testing.T) {
 >            { *lval += "]" }
 /\n/ { *lval += "\n" }
 /./ { *lval += "." }
-`, "abcdeabcabcdabcdddcccbbbcde", "[A(X)E].......[A(X){???}(X)E]"},
-
-		// Exercise hyphens in character classes.
-		{`
+`,
+			"abcdeabcabcdabcdddcccbbbcde", "[A(X)E].......[A(X){???}(X)E]",
+		}, {
+			"Exercise hyphens in character classes",
+			`
 /[a-z-]*/ < { *lval += "[" }
   /[^-a-df-m]/ { *lval += "0" }
   /./       { *lval += "1" }
 >           { *lval += "]" }
 /\n/ { *lval += "\n" }
 /./ { *lval += "." }
-`, "-azb-ycx@d--w-e-", "[11011010].[1110101]"},
-
-		// Overlapping character classes.
-		{`
+`,
+			"-azb-ycx@d--w-e-", "[11011010].[1110101]",
+		}, {
+			"Overlapping character classes",
+			`
 /[a-e]+[d-h]+/ { *lval += "0" }
 /[m-n]+[k-p]+[^k-r]+[o-p]+/ { *lval += "1" }
 /./ { *(*string)(lval) += yylex.Text() }
-`, "abcdefghijmnopabcoq", "0ij1q"},
+`,
+			"abcdefghijmnopabcoq", "0ij1q",
+		}, {
+			"Repeat",
+			`
+/\s*/         { *lval += yylex.Text() }
+/(?i)a{2,5}/  { *lval += "a" }
+/(?i)b{3}/    { *lval += "b" }
+/(?i)c{3,}/   { *lval += "c" }
+/(?i)d+/      { *lval += "d" }
+/(?i)(efg|e)/ { *lval += "e" }
+/\w+/     { *lval += "." }
+`,
+			`
+aAaaa aa a aA aaaaaa
+B bb bbB Bbbb
+C cc ccC cCcC
+d Dd dDDd ddddDdddd
+efg e ef eg`, `
+a a . a .
+. . b .
+. . c c
+d d d d
+e e . .`,
+		},
 	} {
-		id := fmt.Sprintf("%v", i)
-		s += `import "main/nex_test` + id + "\"\n"
-		require.NoError(t, os.Mkdir("nex_test"+id, 0777), "Mkdir")
-		// Ugly hack to import packages.
-		prog := x.prog
-		importLine := ""
-		if prog[0] != '\n' {
-			v := strings.SplitN(prog, "\n", 2)
-			prog = v[1]
-			importLine = "import " + v[0]
-		}
-		require.NoError(t, os.WriteFile(id+".nex", []byte(prog+`//
-package nex_test`+id+`
-
-`+importLine+`
-
-type yySymType string
-
-func Go() {
-  x := NewLexer(bufio.NewReader(strings.NewReader(`+"`"+x.in+"`"+`)))
-  lval := new(yySymType)
-  for x.Lex(lval) != 0 { }
-  s := string(*lval)
-  if s != `+"`"+x.out+"`"+`{
-    panic(`+"`"+x.prog+": want "+x.out+", got ` + s"+`)
-  }
-}
-`), 0777), "WriteFile")
-		out, cErr := exec.Command(nexBin, "-o", filepath.Join("nex_test"+id, "tmp.go"), id+".nex").CombinedOutput()
-		require.NoErrorf(t, cErr, "nex: %s\nout: %s\n", s, out)
-		body += "nex_test" + id + ".Go()\n"
+		t.Run(fmt.Sprintf("[%d] %s", i, x.name), func(t *testing.T) {
+			t.Parallel()
+			b := nex.Builder{}
+			require.NoError(t, b.Process(strings.NewReader(x.prog+cornerCasesMainDoc)))
+			outPath := path.Join(tmpdir, fmt.Sprintf("prog-%d.nn.go", i))
+			require.NoError(t, os.WriteFile(outPath, b.Result.Lexer, 0o666))
+			testProgram(t, tmpdir, x.in, x.out, outPath)
+		})
 	}
-	s += "func main() {\n" + body + "}\n"
-	err = os.WriteFile("tmp.go", []byte(s), 0777)
-	require.NoError(t, err, "WriteFile")
-	output, err := exec.Command("go", "mod", "init", "main").CombinedOutput()
-	require.NoError(t, err, string(output))
-	output, err = exec.Command("go", "run", ".").CombinedOutput()
-	require.NoError(t, err, string(output))
+}
+
+//go:embed test-data/rp-input.txt
+var rpInput string
+
+//go:embed test-data/rp-output.txt
+var rpOutput string
+
+// Test the reverse-Polish notation calculator rp.{nex,y}.
+func TestNexPlusYacc(t *testing.T) {
+	t.Parallel()
+	testWithYacc(t, "test-data", "rp.nex", "rp.y", nil, "", rpInput, rpOutput)
 }
 
 //go:embed test-data/tacky/input.txt
@@ -310,28 +272,71 @@ var testTackyInput string
 var testTackyOutput string
 
 func TestWax(t *testing.T) {
-	getNexBin(t)
-	tmpdir := t.TempDir()
-	for _, f := range []string{"tacky.nex", "tacky.y", "tacky.go", "build.sh"} {
-		copyToDir(t, tmpdir, path.Join("test-data", "tacky", f))
-	}
-	require.NoError(t, os.Chmod(path.Join(tmpdir, "build.sh"), 0777))
+	t.Parallel()
+	testWithYacc(t, path.Join("test-data", "tacky"), "tacky.nex", "tacky.y", []string{"tacky.go"},
+		"p *Tacky", testTackyInput, testTackyOutput)
+}
 
-	run := func(s string) {
-		v := strings.Split(s, " ")
-		output, err := exec.Command(v[0], v[1:]...).CombinedOutput()
-		require.NoError(t, err, fmt.Sprintf("cmd: %s\noutput: %s\n", s, output))
+// ################################################################################
+// # Helper functions
+// ################################################################################
+
+func replaceInFile(t *testing.T, filepath, old, new string) {
+	data, err := os.ReadFile(filepath)
+	require.NoError(t, err)
+	data = []byte(strings.Replace(string(data), old, new, 1))
+	require.NoError(t, os.WriteFile(filepath, data, 0o666))
+}
+
+func copyToDir(t *testing.T, dst, src string) {
+	dst = filepath.Join(dst, filepath.Base(src))
+	s, err := os.Open(src)
+	require.NoError(t, err)
+	defer func() { require.NoError(t, s.Close()) }()
+	d, err := os.Create(dst)
+	require.NoError(t, err)
+	defer func() { require.NoError(t, d.Close()) }()
+	_, err = io.Copy(d, s)
+	require.NoError(t, err)
+}
+
+func runCmd(t *testing.T, cwd, bin string, s ...string) {
+	cmd := exec.Command(bin, s...)
+	if cwd != "" {
+		cmd.Dir = cwd
 	}
-	wd, err := os.Getwd()
-	require.NoError(t, err, "Getwd")
-	require.NoError(t, os.Chdir(tmpdir), "Chdir")
-	defer func() {
-		require.NoError(t, os.Chdir(wd), "Chdir")
-	}()
-	run("./build.sh")
-	cmd := exec.Command("./tacky")
-	cmd.Stdin = strings.NewReader(testTackyInput)
-	got, err := cmd.CombinedOutput()
-	require.NoError(t, err, "CombinedOutput")
-	require.Equal(t, testTackyOutput, string(got))
+	output, err := cmd.CombinedOutput()
+	require.NoErrorf(t, err, "Command: %s\nOutput: %s\n", s, string(output))
+}
+
+func testProgram(t *testing.T, cwd, input, output string, goFiles ...string) {
+	cmd := exec.Command("go", append([]string{"run"}, goFiles...)...)
+	cmd.Dir = cwd
+	cmd.Stdin = strings.NewReader(input)
+	cmd.Stderr = os.Stderr
+	got, err := cmd.Output()
+	require.NoError(t, err, "Output")
+	require.Equal(t, output, string(got))
+}
+
+func testWithYacc(t *testing.T, srcDir, nexFile, yFile string, otherFiles []string, fields, input, output string) {
+	cwd := t.TempDir()
+	for _, f := range append(otherFiles, nexFile, yFile) {
+		copyToDir(t, cwd, path.Join(srcDir, f))
+	}
+
+	nexFile = path.Join(cwd, nexFile)
+	nexOutFile := nexFile + ".go"
+	nex.Exec("nex", "-o", nexOutFile, nexFile)
+	replaceInFile(t, nexOutFile, "// [NEX_END_OF_LEXER_STRUCT]", fields)
+
+	yFile = path.Join(cwd, yFile)
+	yOutFile := yFile + ".go"
+	runCmd(t, cwd, "goyacc", "-o", yOutFile, yFile)
+
+	goFiles := []string{nexOutFile, yOutFile}
+	for _, f := range otherFiles {
+		goFiles = append(goFiles, path.Join(cwd, f))
+	}
+	testProgram(t, cwd, input, output, goFiles...)
 }

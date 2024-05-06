@@ -2,24 +2,23 @@ package nex
 
 import (
 	"fmt"
-	"log"
 )
 
 func mustFunc(f func() bool, err error) {
 	if f() {
-		log.Fatalf("nex: %v", err)
+		logger.Fatalf("nex: %v", err)
 	}
 }
 
-func Mustf(cond bool, format string, a ...any) {
+func mustf(cond bool, format string, a ...any) {
 	if !cond {
-		log.Fatalf("nex: %s", fmt.Sprintf(format, a...))
+		logger.Fatalf("nex: %s", fmt.Sprintf(format, a...))
 	}
 }
 
-func NoError(err error, s string) {
+func noError(err error, s string) {
 	if err != nil {
-		log.Fatalf("nex: %s: %v", s, err)
+		logger.Fatalf("nex: %s: %v", s, err)
 	}
 }
 

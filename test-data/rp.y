@@ -1,5 +1,7 @@
 %{
 package main
+
+import "fmt"
 %}
 
 %union {
@@ -13,7 +15,7 @@ input:    /* empty */
 ;
 
 line:     '\n'
-       | exp '\n'      { println($1.n); }
+       | exp '\n'      { fmt.Println($1.n); }
 ;
 
 exp:     NUM           { $$.n = $1.n;        }

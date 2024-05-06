@@ -35,7 +35,7 @@ type graphBuilder struct {
 type node struct {
 	e      []*edge // Out-edges.
 	id     int     // Index number. Scoped to a family.
-	accept bool    // True if this is an accepting state.
+	accept int     // True if this is an accepting state.
 	set    []int   // The NFA nodes represented by a DFA node.
 }
 
@@ -61,7 +61,7 @@ func (n *node) getEdgeKind(kind int) []*edge {
 }
 
 func (g *graphBuilder) newNode() *node {
-	n := &node{id: g.nextId}
+	n := &node{id: g.nextId, accept: -1}
 	g.nextId++
 	return n
 }
@@ -149,7 +149,7 @@ type dotGraphBuilder struct {
 }
 
 func (b *dotGraphBuilder) show(u *node) {
-	if u.accept {
+	if u.accept >= 0 {
 		_, _ = fmt.Fprintf(b.out, "  %v[style=filled,color=green];\n", u.id)
 	}
 	b.done[u] = true

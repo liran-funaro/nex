@@ -1,15 +1,15 @@
-/[0-9]+/          { println("An integer:", txt()) }
-/[0-9]+\.[0-9]*/  { println("A float:", txt()) }
+/[0-9]+/          { fmt.Println("An integer:", txt()) }
+/[0-9]+\.[0-9]*/  { fmt.Println("A float:", txt()) }
 /if|then|begin|end|procedure|function/
-                  { println("A keyword:", txt()) }
-/[a-z][a-z0-9]*/  { println("An identifier:", txt()) }
-/\+|-|\*|\//      { println("An operator:", txt()) }
+                  { fmt.Println("A keyword:", txt()) }
+/[a-z][a-z0-9]*/  { fmt.Println("An identifier:", txt()) }
+/\+|-|\*|\//      { fmt.Println("An operator:", txt()) }
 /[ \t\n]+/        { /* eat up whitespace */ }
-/./               { println("Unrecognized character:", txt()) }
+/./               { fmt.Println("Unrecognized character:", txt()) }
 /{[^\{\}\n]*}/    { /* eat up one-line comments */ }
 //
 package main
-import "os"
+import ("os";"fmt")
 func main() {
   lex := NewLexer(os.Stdin)
   txt := func() string { return lex.Text() }

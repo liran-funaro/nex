@@ -22,6 +22,7 @@ import (
 const funMacro = "NN_FUN"
 
 var (
+	logger               = log.New(os.Stderr, "[nex] ", log.LstdFlags|log.Lshortfile)
 	ErrExpectedLBrace    = errors.New("expected '{'")
 	ErrUnmatchedLBrace   = errors.New("unmatched '{'")
 	ErrUnexpectedEOF     = errors.New("unexpected EOF")
@@ -58,7 +59,7 @@ type rule struct {
 	startCode string
 	endCode   string
 	kid       []*rule
-	id        string
+	id        int
 }
 
 type Builder struct {
@@ -71,6 +72,7 @@ type Builder struct {
 	out            *bufio.Writer
 	replacer       *strings.Replacer
 	lineno         int
+	colno          int
 	r              rune
 	root           rule
 	needRootRAngle bool
@@ -141,19 +143,19 @@ func (b *Builder) genDFAs(x *rule) {
 	// Regex -> NFA
 	nfaGraph, err := BuildNfa(x)
 	if err != nil {
-		log.Fatal(err)
+		logger.Fatal(err)
 	}
-	b.Result.NfaDot = dumpDotGraph(nfaGraph.Start, "NFA_"+x.id)
+	b.Result.NfaDot = dumpDotGraph(nfaGraph.Start, fmt.Sprintf("NFA_%d", x.id))
 
 	// NFA -> DFA
 	dfaGraph := BuildDfa(nfaGraph)
-	b.Result.DfaDot = dumpDotGraph(dfaGraph.Start, "DFA_"+x.id)
+	b.Result.DfaDot = dumpDotGraph(dfaGraph.Start, fmt.Sprintf("DFA_%d", x.id))
 
 	// DFA -> Go
-	b.writef("\n{ // %v\n acc: map[int]bool{", x.regex)
+	b.writef("dfa{ // %v\n acc: map[int]int{", x.regex)
 	for i, v := range dfaGraph.Nodes {
-		if v.accept {
-			b.writef("%d:%t,", i, v.accept)
+		if v.accept >= 0 {
+			b.writef("%d:%d,", i, v.accept)
 		}
 	}
 	b.writeString("},\n")
@@ -237,14 +239,22 @@ func (b *Builder) genDFAs(x *rule) {
 		b.writeString("},\n")
 	}
 	b.writeString("},\n")
-	if len(x.kid) > 0 {
-		b.writeString("nest: []dfa{")
-		for _, kid := range x.kid {
+	haveNest := false
+	for _, kid := range x.kid {
+		if len(kid.kid) > 0 {
+			if !haveNest {
+				haveNest = true
+				b.writeString("nest: map[int]dfa{\n")
+			}
+			b.writef("%d:", kid.id)
 			b.genDFAs(kid)
+			b.writeString(",\n")
 		}
-		b.writeString("}")
 	}
-	b.writeString("},\n")
+	if haveNest {
+		b.writeString("},\n")
+	}
+	b.writeString("}")
 }
 
 func (b *Builder) tab(lvl int) {
@@ -256,22 +266,22 @@ func (b *Builder) tab(lvl int) {
 func (b *Builder) writeFamily(node *rule, lvl int) {
 	if node.startCode != "" {
 		b.writeStringWithReplace("if !yylex.stale {\n")
-		b.writeString("\t" + node.startCode + "\n")
+		b.writeString(node.startCode + "\n")
 		b.writeString("}\n")
 	}
-	b.writef("OUTER%s%d:\n", node.id, lvl)
+	b.writef("OUTER_%d_%d:\n", node.id, lvl)
 	b.writefWithReplace("for { switch yylex.next(%v) {\n", lvl)
-	for i, x := range node.kid {
-		b.writef("\tcase %d:\n", i)
+	for _, x := range node.kid {
+		b.writef("case %d: // %s\n", x.id, x.regex)
 		if x.kid != nil {
 			b.writeFamily(x, lvl+1)
 		} else {
-			b.writeString("\t" + x.code + "\n")
+			b.writeString(x.code + "\n")
 		}
 	}
-	b.writeString("\tdefault:\n")
-	b.writef("\t\t break OUTER%s%d\n", node.id, lvl)
-	b.writeString("\t}\n")
+	b.writeString("default:\n")
+	b.writef("break OUTER_%d_%d\n", node.id, lvl)
+	b.writeString("}\n")
 	b.writeString("}\n")
 	b.writef("yylex.pop()\n")
 	b.writeString(node.endCode + "\n")
@@ -301,10 +311,13 @@ func (b *Builder) read() bool {
 	}
 	b.err = err
 	if err != nil {
-		log.Fatal(err)
+		logger.Fatal(err)
 	}
 	if b.r == '\n' {
 		b.lineno++
+		b.colno = 0
+	} else {
+		b.colno++
 	}
 	return false
 }
@@ -329,13 +342,13 @@ func (b *Builder) readAll() string {
 
 func (b *Builder) readCode() string {
 	if '{' != b.r {
-		log.Fatal(ErrExpectedLBrace)
+		logger.Fatalf("[%d:%d]: %s - got: %s", b.lineno, b.colno, ErrExpectedLBrace, b.r)
 	}
 	buf := []rune{b.r}
 	nesting := 1
 	for {
 		if b.read() {
-			log.Fatal(ErrUnmatchedLBrace)
+			logger.Fatal(ErrUnmatchedLBrace)
 		}
 		buf = append(buf, b.r)
 		if '{' == b.r {
@@ -355,7 +368,7 @@ func (b *Builder) parse(node *rule) error {
 		mustFunc(b.skipWs, ErrUnexpectedEOF)
 		if '<' == b.r {
 			if node != &b.root || len(node.kid) > 0 {
-				log.Fatal(ErrUnexpectedLAngle)
+				logger.Fatal(ErrUnexpectedLAngle)
 			}
 			mustFunc(b.skipWs, ErrUnexpectedEOF)
 			node.startCode = b.readCode()
@@ -364,7 +377,7 @@ func (b *Builder) parse(node *rule) error {
 		} else if '>' == b.r {
 			if node == &b.root {
 				if !b.needRootRAngle {
-					log.Fatal(ErrUnmatchedRAngle)
+					logger.Fatal(ErrUnmatchedRAngle)
 				}
 			}
 			if b.skipWs() {
@@ -390,13 +403,12 @@ func (b *Builder) parse(node *rule) error {
 			break
 		}
 		mustFunc(b.skipWs, ErrUnexpectedEOF)
-		x := &rule{id: fmt.Sprintf("%d", b.lineno)}
+		x := &rule{id: b.lineno, regex: string(regex)}
 		node.kid = append(node.kid, x)
-		x.regex = string(regex)
 		if '<' == b.r {
 			mustFunc(b.skipWs, ErrUnexpectedEOF)
 			x.startCode = b.readCode()
-			NoError(b.parse(x), "sub-parse")
+			noError(b.parse(x), "sub-parse")
 		} else {
 			x.code = b.readCode()
 		}
@@ -455,11 +467,9 @@ func (b *Builder) Process(inputSource io.Reader) error {
 	b.writeString(userCode)
 
 	// Write DFA states at the end of the file for readability.
-	b.writeString("var dfaStates = []dfa{")
-	for _, kid := range b.root.kid {
-		b.genDFAs(kid)
-	}
-	b.writeString("}")
+	b.writeString("var programDfa = ")
+	b.genDFAs(&b.root)
+	b.writeString("\n")
 
 	b.flush()
 	if b.err != nil {

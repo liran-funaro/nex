@@ -1,5 +1,9 @@
 package nex
 
+import (
+	"slices"
+)
+
 // Dfa - DFA: Deterministic Finite Automaton
 type Dfa struct {
 	Nodes []*node
@@ -15,11 +19,13 @@ func BuildDfa(nfa *Nfa) *Dfa {
 
 	b.constructEndNode()
 
-	states := make([]bool, len(b.nfa.Nodes))
 	// The DFA start state is the state representing the nil-closure of the start
 	// node in the NFA. Recall it has index 0.
-	states[0] = true
-	dfaStart := b.get(states)
+	dfaStart := b.get(b.setToSt([]int{0}))
+
+	// ^.
+	newStartEdge(dfaStart, b.getStartWithClosure(dfaStart))
+
 	for len(b.todo) > 0 {
 		v := b.todo[len(b.todo)-1]
 		b.todo = b.todo[:len(b.todo)-1]
@@ -37,12 +43,9 @@ func BuildDfa(nfa *Nfa) *Dfa {
 			e.lim = []rune{nfa.Lim[j], nfa.Lim[j+1]}
 		}
 		// Wild.
-		newWildEdge(v, b.getCb(v, func(e *edge) bool {
-			return e.kind == kWild
-		}))
-		// ^ and $.
-		newStartEdge(v, b.getCb(v, func(e *edge) bool { return e.kind == kStart }))
-		newEndEdge(v, b.getCb(v, func(e *edge) bool { return e.kind == kEnd }))
+		newWildEdge(v, b.getKind(v, kWild))
+		// $.
+		newEndEdge(v, b.getEndWithClosure(v))
 	}
 
 	sorted := make([]*node, b.nextId)
@@ -65,7 +68,9 @@ type dfaBuilder struct {
 	todo []*node
 }
 
-func stToSet(st []bool) []int {
+type flagSet = []bool
+
+func stToSet(st flagSet) []int {
 	var set []int
 	for i, v := range st {
 		if v {
@@ -75,7 +80,7 @@ func stToSet(st []bool) []int {
 	return set
 }
 
-func makeStKey(st []bool) string {
+func makeStKey(st flagSet) string {
 	buf := make([]rune, len(st))
 	for i, v := range st {
 		if v {
@@ -87,16 +92,36 @@ func makeStKey(st []bool) string {
 	return string(buf)
 }
 
-// nilClose adds all nil steps to the state list
-func (b *dfaBuilder) nilClose(st []bool) {
+func (b *dfaBuilder) newEmptySt() flagSet {
+	return make(flagSet, len(b.nfa.Nodes))
+}
+
+func (b *dfaBuilder) setToSt(set []int) flagSet {
+	st := b.newEmptySt()
+	for _, i := range set {
+		st[i] = true
+	}
+	return st
+}
+
+// closure adds all nil and other steps to the state list
+func (b *dfaBuilder) nilClosure(st flagSet) {
+	b.closure(st, kNil)
+}
+
+// closure adds all nil and other steps to the state list
+func (b *dfaBuilder) closure(st flagSet, kind ...int) {
 	bfs := stToSet(st)
-	visited := make([]bool, len(b.nfa.Nodes))
+	visited := b.newEmptySt()
 	for len(bfs) > 0 {
 		i := bfs[0]
 		bfs = bfs[1:]
+		if visited[i] {
+			continue
+		}
 		visited[i] = true
 		for _, e := range b.nfa.Nodes[i].e {
-			if e.kind == kNil && !visited[e.dst.id] {
+			if !visited[e.dst.id] && slices.Contains(kind, e.kind) {
 				st[e.dst.id] = true
 				bfs = append(bfs, e.dst.id)
 			}
@@ -104,16 +129,18 @@ func (b *dfaBuilder) nilClose(st []bool) {
 	}
 }
 
-func (b *dfaBuilder) stToAccept(st []bool) bool {
+func (b *dfaBuilder) stToAccept(st flagSet) int {
+	acc := -1
 	for i, v := range st {
-		if v && b.nfa.Nodes[i].accept {
-			return true
+		nodeAcc := b.nfa.Nodes[i].accept
+		if v && nodeAcc >= 0 && (acc < 0 || nodeAcc < acc) {
+			acc = nodeAcc
 		}
 	}
-	return false
+	return acc
 }
 
-func (b *dfaBuilder) newDFANode(st []bool) (res *node, found bool) {
+func (b *dfaBuilder) newDFANode(st flagSet) (res *node, found bool) {
 	key := makeStKey(st)
 	res, found = b.tab[key]
 	if !found {
@@ -125,8 +152,20 @@ func (b *dfaBuilder) newDFANode(st []bool) (res *node, found bool) {
 	return res, found
 }
 
-func (b *dfaBuilder) get(st []bool) *node {
-	b.nilClose(st)
+func (b *dfaBuilder) newStartDFANode(st flagSet, accept int) (res *node, found bool) {
+	key := "i" + makeStKey(st)
+	res, found = b.tab[key]
+	if !found {
+		res = b.newNode()
+		res.set = stToSet(st)
+		res.accept = accept
+		b.tab[key] = res
+	}
+	return res, found
+}
+
+func (b *dfaBuilder) get(st flagSet) *node {
+	b.nilClosure(st)
 	nNode, isOld := b.newDFANode(st)
 	if !isOld {
 		b.todo = append(b.todo, nNode)
@@ -136,11 +175,11 @@ func (b *dfaBuilder) get(st []bool) *node {
 
 // constructEndNode Construct the node of no return.
 func (b *dfaBuilder) constructEndNode() {
-	b.tab[makeStKey(make([]bool, len(b.nfa.Nodes)))] = &node{id: -1}
+	b.tab[makeStKey(b.newEmptySt())] = &node{id: -1, accept: -1}
 }
 
 func (b *dfaBuilder) getCb(v *node, cb func(*edge) bool) *node {
-	st := make([]bool, len(b.nfa.Nodes))
+	st := make(flagSet, len(b.nfa.Nodes))
 	for _, i := range v.set {
 		for _, e := range b.nfa.Nodes[i].e {
 			if !st[e.dst.id] {
@@ -149,4 +188,40 @@ func (b *dfaBuilder) getCb(v *node, cb func(*edge) bool) *node {
 		}
 	}
 	return b.get(st)
+}
+
+func (b *dfaBuilder) makeKindSt(v *node, kind ...int) flagSet {
+	st := make(flagSet, len(b.nfa.Nodes))
+	for _, i := range v.set {
+		for _, e := range b.nfa.Nodes[i].e {
+			if !st[e.dst.id] {
+				st[e.dst.id] = slices.Contains(kind, e.kind)
+			}
+		}
+	}
+	return st
+}
+
+func (b *dfaBuilder) getKind(v *node, kind ...int) *node {
+	return b.get(b.makeKindSt(v, kind...))
+}
+
+func (b *dfaBuilder) getEndWithClosure(v *node) *node {
+	st := b.makeKindSt(v, kEnd)
+	b.closure(st, kNil, kEnd)
+	return b.get(st)
+}
+
+func (b *dfaBuilder) getStartWithClosure(v *node) *node {
+	st := b.makeKindSt(v, kStart)
+	b.closure(st, kNil, kStart)
+	accept := b.stToAccept(st)
+	for _, i := range v.set {
+		st[i] = true
+	}
+	nNode, isOld := b.newStartDFANode(st, accept)
+	if !isOld {
+		b.todo = append(b.todo, nNode)
+	}
+	return nNode
 }

@@ -132,5 +132,5 @@ func parseAndShowNfa(exp string) error {
 }
 
 func TestExpressions(t *testing.T) {
-	require.NoError(t, parseAndShowNfa("(?i) [0-9a-z]+ x{2,5} (abc|c) (abc|a) (a|d) (a|b) y{3} y{3,} [^abc]"))
+	require.NoError(t, parseAndShowNfa("(?i) %[0-9a-z]+ x{2,5} (abc|c) (abc|a) (a|d) (a|b) y{3} y{3,} [^abc]"))
 }
