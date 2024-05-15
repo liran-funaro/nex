@@ -36,7 +36,7 @@ var peterOutput string
 
 func TestNexPrograms(t *testing.T) {
 	t.Parallel()
-	for i, x := range []struct {
+	for _, x := range []struct {
 		prog, in, out string
 	}{
 		{"lc.nex", "no newline", "0 10\n"},
@@ -67,7 +67,7 @@ func TestNexPrograms(t *testing.T) {
 				Stderr:        os.Stderr,
 				Stdout:        &stdout,
 			})
-			require.Equalf(t, x.out, string(stdout.Bytes()), "program (%d): %s", i, x.prog)
+			require.Equal(t, x.out, string(stdout.Bytes()))
 		})
 	}
 }
@@ -88,7 +88,10 @@ func main() {
 
 func TestCornerCases(t *testing.T) {
 	t.Parallel()
-	tmpdir := t.TempDir()
+	//tmpdir := t.TempDir()
+	tmpdir, err := filepath.Abs("./test-data/output")
+	require.NoError(t, err)
+	require.NoError(t, os.MkdirAll(tmpdir, os.ModePerm))
 
 	for i, x := range []struct {
 		name, prog, in, out string
@@ -100,11 +103,11 @@ func TestCornerCases(t *testing.T) {
   /a(($*|$$)($($)$$$))$($$$)*/ { *lval += "0" }
   /(e$|f$)/ { *lval += "1" }
   /(qux)*/  { *lval += "2" }
-  /$/       { *lval += "." }
+  /.$/      { *lval += "." }
 >           { *lval += "]" }
 `,
 			"a b c d e f g aaab aaaa eeeg fffe quxqux quxq quxe",
-			"[0][.][.][.][1][1][.][.][0][.][1][2][2][21]",
+			"[0][.][.][.][1][1][.][.][0][.][1][2][2.][21]",
 		}, {
 			"Exercise ^ and rule precedence",
 			`
@@ -119,6 +122,20 @@ func TestCornerCases(t *testing.T) {
 `,
 			"foo bar foooo fooo fooooo fooof baz foofoo",
 			"[1][0][3][2][4][4][.][1]",
+		}, {
+			`Exercise \b and rule precedence`,
+			`
+/[a-z,]*/ <  { *lval += "[" }
+  /((\b*|\b\b)(\b(\b)\b\b\b))\b(\b\b\b)*bar\b/ { *lval += "0" }
+  /(\bfoo\b)*/ { *lval += "1" }
+  /\bfooo\b$/  { *lval += "2" }
+  /\bf(oo)*\b/ { *lval += "3" }
+  /\bfoo*\b/   { *lval += "4" }
+  /\b/         { *lval += "." }
+>              { *lval += "]" }
+`,
+			"foo bar foooo fooo fooooo fooof baz foofoo foo,foo",
+			"[1.][0.][3.][2.][4.][..][..][..][1.1.]",
 		}, {
 			"Anchored empty matches",
 			`
@@ -246,8 +263,10 @@ e e . .`,
 			t.Parallel()
 			b := nex.Builder{}
 			require.NoError(t, b.Process(strings.NewReader(x.prog+cornerCasesMainDoc)))
-			outPath := path.Join(tmpdir, fmt.Sprintf("prog-%d.nn.go", i))
-			require.NoError(t, os.WriteFile(outPath, b.Result.Lexer, 0o666))
+			progDir := path.Join(tmpdir, fmt.Sprintf("prog-%d", i))
+			require.NoError(t, os.MkdirAll(progDir, os.ModePerm))
+			outPath := path.Join(progDir, "main.go")
+			require.NoError(t, os.WriteFile(outPath, b.Result.Lexer, os.ModePerm))
 			testProgram(t, tmpdir, x.in, x.out, outPath)
 		})
 	}

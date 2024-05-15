@@ -6,7 +6,6 @@ import (
 	"context"
 	"fmt"
 	"io"
-	"strings"
 )
 
 type Lexer struct {
@@ -64,7 +63,7 @@ func (yylex *Lexer) Text() string {
 	if len(yylex.stack) == 0 {
 		return ""
 	}
-	return yylex.stack[len(yylex.stack)-1].text
+	return string(yylex.stack[len(yylex.stack)-1].text)
 }
 
 // Line returns the current line number.
@@ -85,74 +84,149 @@ func (yylex *Lexer) Column() int {
 	return yylex.stack[len(yylex.stack)-1].column
 }
 
+type asserts uint64
+
+const (
+	aStartText asserts = 1 << iota
+	aEndText
+	aStartLine
+	aEndLine
+	aWordBoundary
+	aNoWordBoundary
+)
+
 type frame struct {
 	state        int
-	text         string
+	text         []rune
 	line, column int
 }
 
+type state struct {
+	accept     int               // Accept index.
+	assertMask asserts           // We only apply assert-transition with masked bits.
+	assertStep func(asserts) int // Assert transition.
+	runeStep   func(rune) int    // Rune transition.
+}
+
 type dfa struct {
-	acc          map[int]int      // Accepting states.
-	f            []func(rune) int // Transitions.
-	startf, endf map[int]int      // Transitions at start and end of input.
-	nest         map[int]dfa
+	states []state
+	nest   map[int]dfa
 }
 
 type scanner struct {
-	dfa                   *dfa
-	ch                    chan frame
-	ctx                   context.Context
-	in                    *bufio.Reader
-	buf                   []rune
-	eof                   bool
-	pos                   int
+	dfa *dfa
+	ch  chan frame
+	ctx context.Context
+
+	// in should be nil when EOF is reached
+	in *bufio.Reader
+
+	runes          []rune
+	asserts        []asserts
+	pos            int
+	consumedAssert bool
+	minCapture     int
+
 	matchPos, matchAccept int
 	line, column          int
 }
 
-func (s *scanner) next() (rune, bool) {
-	if len(s.buf) > s.pos {
-		r := s.buf[s.pos]
-		s.pos++
-		return r, false
+func (s *scanner) loadNext() {
+	s.loadNextRune()
+	s.loadNextAsserts()
+}
+
+func (s *scanner) loadNextRune() {
+	if s.pos < len(s.runes) || s.in == nil {
+		return
 	}
-	if s.eof {
-		return 0, true
-	}
+
 	r, _, err := s.in.ReadRune()
 	switch err {
 	case nil:
-		s.buf = append(s.buf, r)
-		s.pos++
-		return r, false
+		s.runes = append(s.runes, r)
 	case io.EOF:
-		s.eof = true
-		return 0, true
+		s.in = nil
 	default:
 		panic(err)
 	}
 }
 
-func (s *scanner) isEOF() bool {
-	return s.eof && len(s.buf) == s.pos
+func isWord(r rune) bool {
+	return (r >= 'a' && r <= 'z') || (r >= 'A' && r <= 'Z') || (r >= '0' && r <= '9')
 }
-func (s *scanner) isStopped() bool {
-	return s.ctx.Err() != nil || s.isEOF()
+
+// loadNextAsserts must be called after loadNextRune()
+func (s *scanner) loadNextAsserts() {
+	if s.pos < len(s.asserts) {
+		return
+	}
+
+	var a asserts
+	var r1, r2 rune
+	if s.pos == 0 {
+		a |= aStartText | aStartLine
+	} else {
+		r1 = s.runes[s.pos-1]
+	}
+
+	if s.pos == len(s.runes) {
+		a |= aEndText | aEndLine
+	} else {
+		r2 = s.runes[s.pos]
+	}
+
+	if r1 == '\n' {
+		a |= aStartLine
+	}
+	if r2 == '\n' {
+		a |= aEndLine
+	}
+
+	if isWord(r1) != isWord(r2) {
+		a |= aWordBoundary
+	} else {
+		a |= aNoWordBoundary
+	}
+
+	s.asserts = append(s.asserts, a)
+}
+
+func (s *scanner) consumeRune() (rune, bool) {
+	s.loadNext()
+	if s.pos == len(s.runes) {
+		return 0, false
+	}
+
+	i := s.pos
+	s.pos++
+	s.consumedAssert = false
+	return s.runes[i], true
+}
+
+func (s *scanner) consumeAsserts(mask asserts) asserts {
+	s.loadNext()
+	if s.consumedAssert || s.pos == len(s.asserts) {
+		return 0
+	}
+
+	s.consumedAssert = true
+	return s.asserts[s.pos] & mask
 }
 
 func (s *scanner) checkAccept(st int) {
 	if st < 0 {
 		return
 	}
-	accIndex, ok := s.dfa.acc[st]
+	accIndex := s.dfa.states[st].accept
 	// Higher precedence match
-	if ok && (s.matchPos < s.pos || accIndex < s.matchAccept) {
+	if accIndex > 0 && (s.matchPos < s.pos || accIndex < s.matchAccept) {
 		s.matchAccept, s.matchPos = accIndex, s.pos
 	}
 }
 
 func (s *scanner) resetBuffer(i int) {
-	for _, r := range s.buf[:i] {
+	for _, r := range s.runes[:i] {
 		if r == '\n' {
 			s.line++
 			s.column = 0
@@ -161,8 +235,19 @@ func (s *scanner) resetBuffer(i int) {
 		}
 	}
 
-	s.buf = s.buf[i:]
+	// We load the next rune and asserts before shifting the buffers
+	// to avoid identifying the next rune as the beginning of the text.
+	s.loadNext()
+
+	s.runes = s.runes[i:]
+	s.asserts = s.asserts[i:]
 	s.pos = 0
+	s.consumedAssert = false
+	if i == 0 {
+		s.minCapture = 1
+	} else {
+		s.minCapture = 0
+	}
 }
 
 func (s *scanner) attemptMapFunc(st int, f map[int]int) int {
@@ -178,12 +263,6 @@ func (s *scanner) attemptMapFunc(st int, f map[int]int) int {
 	return st
 }
 
-func (s *scanner) nextState(st int, r rune) int {
-	nextSt := s.dfa.f[st](r)
-	s.checkAccept(nextSt)
-	return nextSt
-}
-
 func (s *scanner) getNest(st int) (*dfa, bool) {
 	if s.dfa.nest == nil {
 		return nil, false
@@ -192,7 +271,7 @@ func (s *scanner) getNest(st int) (*dfa, bool) {
 	return &nestedDfa, ok
 }
 
-func (s *scanner) appendFrame(state int, text string) {
+func (s *scanner) appendFrame(state int, text []rune) {
 	select {
 	case s.ch <- frame{state, text, s.line, s.column}:
 	case <-s.ctx.Done():
@@ -200,42 +279,47 @@ func (s *scanner) appendFrame(state int, text string) {
 }
 
 func (s *scanner) scan() {
-	isStart := true
-
-	// The DFA starts at state 0.
-	for !s.isStopped() {
+	for s.ctx.Err() == nil {
+		// The DFA starts at state 0.
 		st := 0
 		s.matchPos = -1
 		s.matchAccept = -1
-		if isStart {
-			// As we're at the start of input, follow the ^ transition.
-			st = s.attemptMapFunc(st, s.dfa.startf)
-			isStart = false
-		}
-		for st >= 0 {
-			if r, eof := s.next(); !eof {
-				st = s.nextState(st, r)
-			} else { // Handle $.
-				s.attemptMapFunc(st, s.dfa.endf)
-				break
+
+		madeProgress := true
+		for madeProgress && st >= 0 {
+			madeProgress = false
+			if curState := &s.dfa.states[st]; curState.assertStep != nil {
+				if a := s.consumeAsserts(curState.assertMask); a != 0 {
+					st = curState.assertStep(a)
+					s.checkAccept(st)
+					madeProgress = true
+				}
+			}
+
+			if curState := &s.dfa.states[st]; curState.runeStep != nil {
+				if r, ok := s.consumeRune(); ok {
+					st = curState.runeStep(r)
+					s.checkAccept(st)
+					madeProgress = true
+				}
 			}
 		}
 
 		// All DFAs stuck. Return last match if it exists, otherwise advance by one rune and restart.
-		if s.matchPos == -1 {
-			if len(s.buf) == 0 { // This can only happen at the end of input.
+		if s.matchPos < s.minCapture {
+			if len(s.runes) == 0 { // This can only happen at the end of input.
 				break
 			}
 			s.resetBuffer(1)
 			continue
 		}
 
-		text := string(s.buf[:s.matchPos])
+		text := s.runes[:s.matchPos]
 		s.appendFrame(s.matchAccept, text)
 		if nestedDfa, ok := s.getNest(s.matchAccept); ok {
 			ns := scanner{
 				dfa:    nestedDfa,
-				in:     bufio.NewReader(strings.NewReader(text)),
+				runes:  text,
 				line:   s.line,
 				column: s.column,
 				ch:     s.ch,
@@ -245,7 +329,7 @@ func (s *scanner) scan() {
 		}
 		s.resetBuffer(s.matchPos)
 	}
-	s.appendFrame(-1, "")
+	s.appendFrame(-1, nil)
 }
 
 func (yylex *Lexer) next(lvl int) int {
@@ -254,7 +338,7 @@ func (yylex *Lexer) next(lvl int) int {
 		if lvl > 0 {
 			l, c = yylex.stack[lvl-1].line, yylex.stack[lvl-1].column
 		}
-		yylex.stack = append(yylex.stack, frame{0, "", l, c})
+		yylex.stack = append(yylex.stack, frame{0, nil, l, c})
 	}
 	if lvl == len(yylex.stack)-1 {
 		yylex.stack[lvl] = <-yylex.ch

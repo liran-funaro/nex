@@ -33,7 +33,7 @@ var (
 	lexerCode, lexerLexMethodIntro, lexerLexMethodOutro, lexerErrorMethod = lexerText()
 )
 
-//go:embed lexer_template.go
+//go:embed lexer.go
 var lexerTextFull string
 
 func lexerText() (string, string, string, string) {
@@ -139,106 +139,118 @@ func (b *Builder) writefWithReplace(format string, a ...any) {
 	}
 }
 
+func (b *Builder) writeState(i int, v *node) {
+	b.writef("{ // State %d\n", i)
+
+	var consumeRune bool
+	wildDst := -1
+	if wildE := v.getEdgeKind(kWild); len(wildE) > 0 {
+		wildDst = wildE[0].dst.id
+		consumeRune = true
+	}
+
+	var assertMap, runeMap, classMap map[int][]string
+	var assertMask asserts
+	if assertE := v.getEdgeKind(kAssert); len(assertE) > 0 {
+		assertMap = map[int][]string{}
+		for _, e := range assertE {
+			assertMap[e.dst.id] = append(assertMap[e.dst.id], assertsToString(e.a))
+			assertMask |= e.a
+		}
+	}
+
+	if runeE := v.getEdgeKind(kRune); len(runeE) > 0 {
+		runeMap = map[int][]string{}
+		for _, e := range runeE {
+			consumeRune = true
+			if e.dst.id == wildDst {
+				continue
+			}
+			runeMap[e.dst.id] = append(runeMap[e.dst.id], fmt.Sprintf("%q", e.r))
+		}
+	}
+	if classE := v.getEdgeKind(kClass); len(classE) > 0 {
+		classMap = map[int][]string{}
+		for _, e := range classE {
+			consumeRune = true
+			if e.dst.id == wildDst {
+				continue
+			}
+			classMap[e.dst.id] = append(classMap[e.dst.id], fmt.Sprintf("%q <= r && r <= %q", e.lim[0], e.lim[1]))
+		}
+	}
+
+	if v.accept >= 0 {
+		b.writef("accept: %d,\n", v.accept)
+	}
+
+	if len(assertMap) > 0 {
+		b.writef("assertMask: %s,\n", assertsToString(assertMask))
+		b.writeString("assertStep: func(a asserts) int {\n")
+		b.writeString("switch (a) {\n")
+		for ret, caseValue := range assertMap {
+			b.writef("case %s: return %d\n", strings.Join(caseValue, ","), ret)
+		}
+		b.writeString("default: return -1\n}\n},\n")
+	}
+
+	if consumeRune {
+		b.writeString("runeStep: func(r rune) int {\n")
+
+		if len(runeMap) > 0 {
+			b.writeString("switch(r) {\n")
+			for ret, caseValue := range runeMap {
+				b.writef("case %s: return %d\n", strings.Join(caseValue, ","), ret)
+			}
+			b.writeString("}\n")
+		}
+
+		if len(classMap) > 0 {
+			b.writeString("switch {\n")
+			for ret, caseValue := range classMap {
+				if len(caseValue) > 1 {
+					for i, c := range caseValue {
+						caseValue[i] = fmt.Sprintf("(%s)", c)
+					}
+				}
+				b.writef("case %s: return %d\n", strings.Join(caseValue, " || "), ret)
+			}
+			b.writeString("}\n")
+		}
+
+		b.writef("return %d\n},\n", wildDst)
+	}
+
+	b.writeString("},")
+}
+
 func (b *Builder) genDFAs(x *rule) {
 	// Regex -> NFA
-	nfaGraph, err := BuildNfa(x)
+	nfaRoot, err := BuildNfa(x)
 	if err != nil {
 		logger.Fatal(err)
 	}
-	b.Result.NfaDot = dumpDotGraph(nfaGraph.Start, fmt.Sprintf("NFA_%d", x.id))
+	b.Result.NfaDot = dumpDotGraph(nfaRoot, fmt.Sprintf("NFA_%d", x.id))
 
 	// NFA -> DFA
-	dfaGraph := BuildDfa(nfaGraph)
+	dfaGraph := BuildDfa(nfaRoot)
 	b.Result.DfaDot = dumpDotGraph(dfaGraph.Start, fmt.Sprintf("DFA_%d", x.id))
 
 	// DFA -> Go
-	b.writef("dfa{ // %v\n acc: map[int]int{", x.regex)
-	for i, v := range dfaGraph.Nodes {
-		if v.accept >= 0 {
-			b.writef("%d:%d,", i, v.accept)
-		}
-	}
-	b.writeString("},\n")
-
-	m := map[int]int{}
-	for i, v := range dfaGraph.Nodes {
-		if e := v.getEdgeKind(kStart); len(e) > 0 && e[0].dst.id >= 0 {
-			m[i] = e[0].dst.id
-		}
-	}
-	if len(m) > 0 {
-		b.writeString("startf: map[int]int{")
-		for i, dst := range m {
-			b.writef("%d:%d,", i, dst)
-		}
-		b.writeString("},\n")
+	if x.regex != "" {
+		b.writef("dfa{ // %v\n", x.regex)
+	} else {
+		b.writeString("dfa{\n")
 	}
 
-	m = map[int]int{}
-	for i, v := range dfaGraph.Nodes {
-		if e := v.getEdgeKind(kEnd); len(e) > 0 && e[0].dst.id >= 0 {
-			m[i] = e[0].dst.id
+	if len(dfaGraph.Nodes) > 0 {
+		b.writeString("states: []state{\n")
+		for i, v := range dfaGraph.Nodes {
+			b.writeState(i, v)
 		}
-	}
-	if len(m) > 0 {
-		b.writeString("endf: map[int]int{")
-		for i, dst := range m {
-			b.writef("%d:%d,", i, dst)
-		}
-		b.writeString("},\n")
+		b.writeString("\n},\n")
 	}
 
-	b.writeString("f: []func(rune) int{\n")
-	for i, v := range dfaGraph.Nodes {
-		b.writef("func(r rune) int { // State %d\n", i)
-		wildDst := -1
-		if wildE := v.getEdgeKind(kWild); len(wildE) > 0 {
-			wildDst = wildE[0].dst.id
-		}
-
-		if runeE := v.getEdgeKind(kRune); len(runeE) > 0 {
-			m := map[int][]string{}
-			for _, e := range runeE {
-				if e.dst.id == wildDst {
-					continue
-				}
-				m[e.dst.id] = append(m[e.dst.id], fmt.Sprintf("%q", e.r))
-			}
-			if len(m) > 0 {
-				b.writeString("switch(r) {\n")
-				for ret, caseValue := range m {
-					b.writef("case %s: return %d\n", strings.Join(caseValue, ","), ret)
-				}
-				b.writeString("}\n")
-			}
-		}
-
-		if classE := v.getEdgeKind(kClass); len(classE) > 0 {
-			m := map[int][]string{}
-			for _, e := range classE {
-				if e.dst.id == wildDst {
-					continue
-				}
-				m[e.dst.id] = append(m[e.dst.id], fmt.Sprintf("%q <= r && r <= %q", e.lim[0], e.lim[1]))
-			}
-			if len(m) > 0 {
-				b.writeString("switch {\n")
-				for ret, caseValue := range m {
-					if len(caseValue) > 1 {
-						for i, c := range caseValue {
-							caseValue[i] = fmt.Sprintf("(%s)", c)
-						}
-					}
-					b.writef("case %s: return %d\n", strings.Join(caseValue, " || "), ret)
-				}
-				b.writeString("}\n")
-			}
-		}
-
-		b.writef("return %d\n", wildDst)
-		b.writeString("},\n")
-	}
-	b.writeString("},\n")
 	haveNest := false
 	for _, kid := range x.kid {
 		if len(kid.kid) > 0 {
@@ -487,7 +499,7 @@ func (b *Builder) Process(inputSource io.Reader) error {
 func formatCode(src []byte) ([]byte, error) {
 	src, err := format.Source(src)
 	if err != nil {
-		return src, err
+		return src, fmt.Errorf("failed formmatting code: %w", err)
 	}
 	return imports.Process("main.go", src, &imports.Options{
 		TabWidth:  8,

@@ -4,28 +4,24 @@ import (
 	"bytes"
 	"fmt"
 	"io"
-	"slices"
 	"strconv"
+	"strings"
 )
 
 const (
 	kNil = iota
 	kRune
 	kClass
+	kAssert
 	kWild
-	kStart
-	kEnd
 )
 
 type edge struct {
-	kind int           // Rune/Class/Wild/Nil.
-	r    rune          // Rune for rune edges.
-	lim  charTypeEdges // Pairs of limits for character class edges.
-	dst  *node         // Destination node.
-}
-
-func edgeCompare(a, b *edge) int {
-	return int(a.r - b.r)
+	kind int     // Rune/Class/Wild/Nil.
+	r    rune    // Rune for rune edges.
+	a    asserts // Asserts for assert edges.
+	lim  limits  // Pairs of limits for character class edges.
+	dst  *node   // Destination node.
 }
 
 type graphBuilder struct {
@@ -39,9 +35,9 @@ type node struct {
 	set    []int   // The NFA nodes represented by a DFA node.
 }
 
-type charTypeEdges []rune
+type limits []rune
 
-func (l charTypeEdges) inClass(r rune) bool {
+func (l limits) inClass(r rune) bool {
 	for i := 0; i < len(l); i += 2 {
 		if l[i] <= r && r <= l[i+1] {
 			return true
@@ -50,10 +46,28 @@ func (l charTypeEdges) inClass(r rune) bool {
 	return false
 }
 
+func insertLimits(l limits, i int, r1, r2 rune) limits {
+	l = append(l, 0, 0)
+	copy(l[i+2:], l[i:])
+	l[i] = r1
+	l[i+1] = r2
+	return l
+}
+
 func (n *node) getEdgeKind(kind int) []*edge {
 	var res []*edge
 	for _, e := range n.e {
 		if e.kind == kind {
+			res = append(res, e)
+		}
+	}
+	return res
+}
+
+func (n *node) getEdgeAssert(a asserts) []*edge {
+	var res []*edge
+	for _, e := range n.e {
+		if e.kind == kAssert && (e.a&a) != 0 {
 			res = append(res, e)
 		}
 	}
@@ -67,24 +81,15 @@ func (g *graphBuilder) newNode() *node {
 }
 
 func newEdge(u, v *node) *edge {
-	res := &edge{dst: v}
-	u.e = append(u.e, res)
-	slices.SortFunc(u.e, edgeCompare)
-	return res
+	e := &edge{dst: v}
+	u.e = append(u.e, e)
+	return e
 }
 
 func newKindEdge(u, v *node, kind int) *edge {
-	res := newEdge(u, v)
-	res.kind = kind
-	return res
-}
-
-func newStartEdge(u, v *node) *edge {
-	return newKindEdge(u, v, kStart)
-}
-
-func newEndEdge(u, v *node) *edge {
-	return newKindEdge(u, v, kEnd)
+	e := newEdge(u, v)
+	e.kind = kind
+	return e
 }
 
 func newWildEdge(u, v *node) *edge {
@@ -94,14 +99,22 @@ func newWildEdge(u, v *node) *edge {
 func newNilEdge(u, v *node) *edge {
 	return newKindEdge(u, v, kNil)
 }
-func newClassEdge(u, v *node) *edge {
-	return newKindEdge(u, v, kClass)
+func newClassEdge(u, v *node, lim []rune) *edge {
+	e := newKindEdge(u, v, kClass)
+	e.lim = lim
+	return e
 }
 
 func newRuneEdge(u, v *node, r rune) *edge {
-	res := newKindEdge(u, v, kRune)
-	res.r = r
-	return res
+	e := newKindEdge(u, v, kRune)
+	e.r = r
+	return e
+}
+
+func newAssertEdge(u, v *node, a asserts) *edge {
+	e := newKindEdge(u, v, kAssert)
+	e.a = a
+	return e
 }
 
 func compactGraph(start *node) []*node {
@@ -187,4 +200,27 @@ func (b *dotGraphBuilder) show(u *node) {
 			b.show(e.dst)
 		}
 	}
+}
+
+var assertsString = map[asserts]string{
+	aStartText:      "aStartText",
+	aEndText:        "aEndText",
+	aStartLine:      "aStartLine",
+	aEndLine:        "aEndLine",
+	aWordBoundary:   "aWordBoundary",
+	aNoWordBoundary: "aNoWordBoundary",
+}
+
+func assertsToString(a asserts) string {
+	if a == 0 {
+		return "0"
+	}
+
+	var asList []string
+	for k, v := range assertsString {
+		if a&k != 0 {
+			asList = append(asList, v)
+		}
+	}
+	return strings.Join(asList, "|")
 }
