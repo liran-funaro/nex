@@ -13,6 +13,7 @@ import (
 	"testing"
 
 	"github.com/liran-funaro/nex/nex"
+	"github.com/liran-funaro/nex/nex/parser"
 	"github.com/stretchr/testify/require"
 )
 
@@ -59,14 +60,14 @@ func TestNexPrograms(t *testing.T) {
 		t.Run(x.prog, func(t *testing.T) {
 			t.Parallel()
 			var stdout bytes.Buffer
-			nex.ExecWithParams(&nex.ExecParams{
+			require.NoError(t, nex.ExecWithParams(&nex.ExecParams{
 				InputFilename: path.Join("test-data", x.prog),
 				Standalone:    true,
 				RunProgram:    true,
 				Stdin:         strings.NewReader(x.in),
 				Stderr:        os.Stderr,
 				Stdout:        &stdout,
-			})
+			}))
 			require.Equal(t, x.out, string(stdout.Bytes()))
 		})
 	}
@@ -99,12 +100,13 @@ func TestCornerCases(t *testing.T) {
 		{
 			"Test parentheses and $",
 			`
-/[a-z]*/ <  { *lval += "[" }
-  /a(($*|$$)($($)$$$))$($$$)*/ { *lval += "0" }
-  /(e$|f$)/ { *lval += "1" }
-  /(qux)*/  { *lval += "2" }
-  /.$/      { *lval += "." }
->           { *lval += "]" }
+/[a-z]*/ <   *lval += "["
+  /a(($*|$$)($($)$$$))$($$$)*/
+             *lval += "0"
+  /(e$|f$)/  *lval += "1"
+  /(qux)*/   *lval += "2"
+  /.$/       *lval += "."
+>            *lval += "]"
 `,
 			"a b c d e f g aaab aaaa eeeg fffe quxqux quxq quxe",
 			"[0][.][.][.][1][1][.][.][0][.][1][2][2.][21]",
@@ -261,12 +263,15 @@ e e . .`,
 	} {
 		t.Run(fmt.Sprintf("[%d] %s", i, x.name), func(t *testing.T) {
 			t.Parallel()
-			b := nex.Builder{}
-			require.NoError(t, b.Process(strings.NewReader(x.prog+cornerCasesMainDoc)))
+			program, err := parser.ParseNex(strings.NewReader(x.prog + cornerCasesMainDoc))
+			require.NoError(t, err)
+			b := nex.LexerBuilder{}
+			code, err := b.DumpFormattedLexer(program)
+			require.NoError(t, err)
 			progDir := path.Join(tmpdir, fmt.Sprintf("prog-%d", i))
 			require.NoError(t, os.MkdirAll(progDir, os.ModePerm))
 			outPath := path.Join(progDir, "main.go")
-			require.NoError(t, os.WriteFile(outPath, b.Result.Lexer, os.ModePerm))
+			require.NoError(t, os.WriteFile(outPath, code, os.ModePerm))
 			testProgram(t, tmpdir, x.in, x.out, outPath)
 		})
 	}
@@ -346,7 +351,7 @@ func testWithYacc(t *testing.T, srcDir, nexFile, yFile string, otherFiles []stri
 
 	nexFile = path.Join(cwd, nexFile)
 	nexOutFile := nexFile + ".go"
-	nex.Exec("nex", "-o", nexOutFile, nexFile)
+	require.NoError(t, nex.Exec("nex", "-o", nexOutFile, nexFile))
 	replaceInFile(t, nexOutFile, "// [NEX_END_OF_LEXER_STRUCT]", fields)
 
 	yFile = path.Join(cwd, yFile)

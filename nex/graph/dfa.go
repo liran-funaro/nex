@@ -1,29 +1,22 @@
-package nex
+package graph
 
 import (
 	"slices"
 )
 
-// Dfa - DFA: Deterministic Finite Automaton
-type Dfa struct {
-	Nodes []*node
-	Start *node
-}
-
 // BuildDfa NFA -> DFA
-func BuildDfa(nfaRoot *node) *Dfa {
+// DFA: Deterministic Finite Automaton
+func BuildDfa(nfa []*Node) []*Node {
 	b := dfaBuilder{
-		// Compute shortlist of nodes (reachable nodes), as we may have discarded
-		// nodes left over from parsing. Also, make `nfaRoot` the start node.
-		nfa: compactGraph(nfaRoot),
-		tab: make(map[stKey]*node),
+		nfa: nfa,
+		tab: make(map[stKey]*Node),
 	}
 	b.constructAllNilList()
 	b.constructEndNode()
 
 	// The DFA start state is the state representing the nil-closure of the start
 	// node in the NFA. Recall it has index 0.
-	dfaStart := b.get(b.setToSt([]int{0}, nfAccepting))
+	b.get(b.setToSt([]int{0}, nfAccepting))
 
 	for len(b.todo) > 0 {
 		v := b.nextTodo()
@@ -36,41 +29,38 @@ func BuildDfa(nfaRoot *node) *Dfa {
 
 		// Singles.
 		for _, r := range alphabet {
-			newRuneEdge(v, b.getCb(v, func(e *edge) bool {
-				return (e.kind == kRune && e.r == r) || e.kind == kWild || (e.kind == kClass && e.lim.inClass(r))
+			newRuneEdge(v, b.getCb(v, func(e *Edge) bool {
+				return (e.Kind == KRune && e.R == r) || e.Kind == KWild || (e.Kind == KClass && e.Lim.inClass(r))
 			}), r)
 		}
 
 		// Ranges.
 		for j := 0; j < len(l); j += 2 {
-			newClassEdge(v, b.getCb(v, func(e *edge) bool {
-				return e.kind == kWild || (e.kind == kClass && e.lim.inClass(l[j]))
+			newClassEdge(v, b.getCb(v, func(e *Edge) bool {
+				return e.Kind == KWild || (e.Kind == KClass && e.Lim.inClass(l[j]))
 			}), []rune{l[j], l[j+1]})
 		}
 
 		// Wild.
-		newWildEdge(v, b.getKind(v, kWild))
+		newWildEdge(v, b.getKind(v, KWild))
 	}
 
-	sorted := make([]*node, b.nextId)
+	sorted := make([]*Node, b.nextId)
 	for _, v := range b.tab {
-		if -1 != v.id {
-			sorted[v.id] = v
+		if -1 != v.Id {
+			sorted[v.Id] = v
 		}
 	}
 
-	return &Dfa{
-		Start: dfaStart,
-		Nodes: sorted,
-	}
+	return sorted
 }
 
 type dfaBuilder struct {
 	graphBuilder
-	nfa         []*node
+	nfa         []*Node
 	allNilNodes []int
-	tab         map[stKey]*node
-	todo        []*node
+	tab         map[stKey]*Node
+	todo        []*Node
 }
 
 type stKey struct {
@@ -87,36 +77,36 @@ const (
 	nfAccepting
 )
 
-func (b *dfaBuilder) getDfaEdges(v *node) ([]rune, limits, []asserts) {
+func (b *dfaBuilder) getDfaEdges(v *Node) ([]rune, limits, []Asserts) {
 	alphabet := make(map[rune]any)
-	var a asserts
+	var a Asserts
 	var l limits
-	for _, i := range v.set {
-		for _, e := range b.nfa[i].e {
-			switch e.kind {
-			case kClass:
-				for j := 0; j < len(e.lim); j += 2 {
-					if e.lim[j] == e.lim[j+1] {
-						alphabet[e.lim[j]] = nil
+	for _, i := range v.Set {
+		for _, e := range b.nfa[i].E {
+			switch e.Kind {
+			case KClass:
+				for j := 0; j < len(e.Lim); j += 2 {
+					if e.Lim[j] == e.Lim[j+1] {
+						alphabet[e.Lim[j]] = nil
 					} else {
-						l = appendLimits(l, e.lim[j], e.lim[j+1])
+						l = appendLimits(l, e.Lim[j], e.Lim[j+1])
 					}
 				}
-			case kRune:
-				alphabet[e.r] = nil
-			case kAssert:
-				a |= e.a
+			case KRune:
+				alphabet[e.R] = nil
+			case KAssert:
+				a |= e.A
 			}
 		}
 	}
-	st := b.setToSt(v.set, nfAccepting)
-	b.closure(st, func(e *edge) bool {
-		return e.kind == kAssert
+	st := b.setToSt(v.Set, nfAccepting)
+	b.closure(st, func(e *Edge) bool {
+		return e.Kind == KAssert
 	})
 	for _, i := range stToSet(st) {
-		for _, e := range b.nfa[i].e {
-			if e.kind == kAssert {
-				a |= e.a
+		for _, e := range b.nfa[i].E {
+			if e.Kind == KAssert {
+				a |= e.A
 			}
 		}
 	}
@@ -146,7 +136,7 @@ func (b *dfaBuilder) makeStKey(st flagSet) stKey {
 		}
 		buf[i] = '1'
 
-		nodeAcc := b.nfa[i].accept
+		nodeAcc := b.nfa[i].Accept
 		if v == nfAccepting && nodeAcc >= 0 && (acc < 0 || nodeAcc < acc) {
 			acc = nodeAcc
 		}
@@ -176,7 +166,7 @@ func (b *dfaBuilder) nilClosure(st flagSet) {
 }
 
 // closure adds all nil and other steps to the state list
-func (b *dfaBuilder) closure(st flagSet, cb func(*edge) bool) {
+func (b *dfaBuilder) closure(st flagSet, cb func(*Edge) bool) {
 	bfs := stToSet(st)
 	visited := make([]bool, len(b.nfa))
 	for len(bfs) > 0 {
@@ -186,26 +176,26 @@ func (b *dfaBuilder) closure(st flagSet, cb func(*edge) bool) {
 			continue
 		}
 		visited[i] = true
-		for _, e := range b.nfa[i].e {
-			if visited[e.dst.id] {
+		for _, e := range b.nfa[i].E {
+			if visited[e.Dst.Id] {
 				continue
 			}
-			if e.kind == kNil || (cb != nil && cb(e)) {
-				st[e.dst.id] = nfAccepting
-				bfs = append(bfs, e.dst.id)
+			if e.Kind == KNil || (cb != nil && cb(e)) {
+				st[e.Dst.Id] = nfAccepting
+				bfs = append(bfs, e.Dst.Id)
 			}
 		}
 	}
 }
 
-func (b *dfaBuilder) get(st flagSet) *node {
+func (b *dfaBuilder) get(st flagSet) *Node {
 	b.nilClosure(st)
 	key := b.makeStKey(st)
 	nNode, found := b.tab[key]
 	if !found {
 		nNode = b.newNode()
-		nNode.set = stToSet(st)
-		nNode.accept = key.accept
+		nNode.Set = stToSet(st)
+		nNode.Accept = key.accept
 		b.tab[key] = nNode
 	}
 	if !found {
@@ -214,7 +204,7 @@ func (b *dfaBuilder) get(st flagSet) *node {
 	return nNode
 }
 
-func (b *dfaBuilder) nextTodo() *node {
+func (b *dfaBuilder) nextTodo() *Node {
 	v := b.todo[len(b.todo)-1]
 	b.todo = b.todo[:len(b.todo)-1]
 	return v
@@ -222,17 +212,17 @@ func (b *dfaBuilder) nextTodo() *node {
 
 // constructEndNode Construct the node of no return.
 func (b *dfaBuilder) constructEndNode() {
-	b.tab[b.makeStKey(b.newEmptySt())] = &node{id: -1, accept: -1}
+	b.tab[b.makeStKey(b.newEmptySt())] = &Node{Id: -1, Accept: -1}
 }
 
 func (b *dfaBuilder) constructAllNilList() {
 	for i, n := range b.nfa {
-		if n.accept > -1 {
+		if n.Accept > -1 {
 			continue
 		}
 		var haveNonNil bool
-		for _, e := range n.e {
-			if e.kind != kNil {
+		for _, e := range n.E {
+			if e.Kind != KNil {
 				haveNonNil = true
 				break
 			}
@@ -243,42 +233,42 @@ func (b *dfaBuilder) constructAllNilList() {
 	}
 }
 
-func (b *dfaBuilder) getCb(v *node, cb func(*edge) bool) *node {
+func (b *dfaBuilder) getCb(v *Node, cb func(*Edge) bool) *Node {
 	return b.get(b.makeSt(v, cb))
 }
 
-func (b *dfaBuilder) makeSt(v *node, cb func(*edge) bool) flagSet {
+func (b *dfaBuilder) makeSt(v *Node, cb func(*Edge) bool) flagSet {
 	st := b.newEmptySt()
-	for _, i := range v.set {
-		for _, e := range b.nfa[i].e {
-			if st[e.dst.id] != nfAccepting && cb(e) {
-				st[e.dst.id] = nfAccepting
+	for _, i := range v.Set {
+		for _, e := range b.nfa[i].E {
+			if st[e.Dst.Id] != nfAccepting && cb(e) {
+				st[e.Dst.Id] = nfAccepting
 			}
 		}
 	}
 	return st
 }
 
-func (b *dfaBuilder) makeKindSt(v *node, kind ...int) flagSet {
-	return b.makeSt(v, func(e *edge) bool {
-		return slices.Contains(kind, e.kind)
+func (b *dfaBuilder) makeKindSt(v *Node, kind ...int) flagSet {
+	return b.makeSt(v, func(e *Edge) bool {
+		return slices.Contains(kind, e.Kind)
 	})
 }
 
-func (b *dfaBuilder) getKind(v *node, kind ...int) *node {
+func (b *dfaBuilder) getKind(v *Node, kind ...int) *Node {
 	return b.get(b.makeKindSt(v, kind...))
 }
 
-func (b *dfaBuilder) getAssertWithClosure(v *node, a asserts) *node {
-	st := b.setToSt(v.set, nfNotAccepting)
-	b.closure(st, func(e *edge) bool {
-		return e.kind == kAssert && (e.a&a) != 0
+func (b *dfaBuilder) getAssertWithClosure(v *Node, a Asserts) *Node {
+	st := b.setToSt(v.Set, nfNotAccepting)
+	b.closure(st, func(e *Edge) bool {
+		return e.Kind == KAssert && (e.A&a) != 0
 	})
 	return b.get(st)
 }
 
-func getAssertsSubsets(a asserts) []asserts {
-	var options []asserts
+func getAssertsSubsets(a Asserts) []Asserts {
+	var options []Asserts
 	for i := 0; a != 0; i++ {
 		if a&1 != 0 {
 			options = append(options, 1<<i)
@@ -294,9 +284,9 @@ func getAssertsSubsets(a asserts) []asserts {
 		return options
 	}
 	allSubsetsSize := 1 << opSize
-	perm := make([]asserts, allSubsetsSize-1)
+	perm := make([]Asserts, allSubsetsSize-1)
 	for i := 1; i < allSubsetsSize; i++ {
-		var set asserts
+		var set Asserts
 		for j, v := range options {
 			if i&(1<<j) != 0 {
 				set |= v

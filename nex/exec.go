@@ -2,11 +2,14 @@ package nex
 
 import (
 	"flag"
+	"fmt"
 	"io"
 	"os"
 	"os/exec"
 	"path"
 	"strings"
+
+	"github.com/liran-funaro/nex/nex/parser"
 )
 
 type ExecParams struct {
@@ -23,7 +26,7 @@ type ExecParams struct {
 	Stderr               io.Writer
 }
 
-func Exec(name string, args ...string) {
+func ParseExecParams(name string, args ...string) (*ExecParams, error) {
 	f := flag.NewFlagSet(name, flag.ExitOnError)
 	p := &ExecParams{
 		Stdin:  os.Stdin,
@@ -41,61 +44,114 @@ func Exec(name string, args ...string) {
 	// Ignore errors; CommandLine is set for ExitOnError.
 	_ = f.Parse(args)
 
-	mustf(f.NArg() < 2, "extraneous arguments after %s", f.Arg(0))
+	if f.NArg() > 1 {
+		return nil, fmt.Errorf("extraneous arguments after %s", f.Arg(0))
+	}
 	if f.NArg() > 0 {
 		p.InputFilename = f.Arg(0)
 	}
-
-	ExecWithParams(p)
+	return p, nil
 }
 
-func ExecWithParams(p *ExecParams) {
-	b := &Builder{
-		CustomPrefix: p.CustomPrefix,
-		Standalone:   p.Standalone,
-		CustomError:  p.CustomError,
+func Exec(name string, args ...string) error {
+	p, err := ParseExecParams(name, args...)
+	if err != nil {
+		return fmt.Errorf("parse-params: %w", err)
+	}
+	return ExecWithParams(p)
+}
+
+func ExecWithParams(p *ExecParams) error {
+	var err error
+	program, err := p.parseNex()
+	if err != nil {
+		return fmt.Errorf("parse-program: %w", err)
+	}
+	if err = writeWithWriter(p.NfaDotOutputFilename, program.WriteNFADotGraph); err != nil {
+		return err
+	}
+	if err = writeWithWriter(p.DfaDotOutputFilename, program.WriteDFADotGraph); err != nil {
+		return err
 	}
 
 	if p.RunProgram && p.OutputFilename == "" {
 		tmpdir, err := os.MkdirTemp("", "nex")
-		noError(err, "tempdir")
+		if err != nil {
+			return fmt.Errorf("temp-dir: %w", err)
+		}
 		defer func() {
 			_ = os.RemoveAll(tmpdir)
 		}()
 		p.OutputFilename = path.Join(tmpdir, "lets.go")
 	}
 
+	if p.InputFilename != "" && p.OutputFilename == "" {
+		basename := strings.TrimSuffix(p.InputFilename, path.Ext(p.InputFilename))
+		p.OutputFilename = basename + ".nn.go"
+	}
+	if p.OutputFilename == "" {
+		return nil
+	}
+
+	b := &LexerBuilder{
+		CustomPrefix: p.CustomPrefix,
+		Standalone:   p.Standalone,
+		CustomError:  p.CustomError,
+	}
+	code, err := b.DumpFormattedLexer(program)
+	if err != nil {
+		return fmt.Errorf("dump lexer: %w", err)
+	}
+	if code == nil {
+		return nil
+	}
+
+	if err := os.WriteFile(p.OutputFilename, code, 0666); err != nil {
+		return fmt.Errorf("write lexer: %w", err)
+	}
+
+	if !p.RunProgram {
+		return nil
+	}
+
+	c := exec.Command("go", "run", p.OutputFilename)
+	c.Stdin, c.Stdout, c.Stderr = p.Stdin, p.Stdout, p.Stderr
+	if err := c.Run(); err != nil {
+		return fmt.Errorf("run lexer: %w", err)
+	}
+	return nil
+}
+
+func closeFile(f *os.File) {
+	_ = f.Close()
+}
+
+func (p *ExecParams) parseNex() (*parser.NexProgram, error) {
 	infile := os.Stdin
+	var err error
 	if p.InputFilename != "" {
-		var err error
 		infile, err = os.Open(p.InputFilename)
-		noError(err, "open")
-		defer func() {
-			_ = infile.Close()
-		}()
-		if p.OutputFilename == "" {
-			basename := strings.TrimSuffix(p.InputFilename, path.Ext(p.InputFilename))
-			p.OutputFilename = basename + ".nn.go"
+		if err != nil {
+			return nil, fmt.Errorf("open input: %w", err)
 		}
+		defer closeFile(infile)
 	}
 
-	noError(b.Process(infile), "process")
+	program, err := parser.ParseNex(infile)
+	if err != nil {
+		return nil, fmt.Errorf("parse: %w", err)
+	}
+	return program, nil
+}
 
-	if p.NfaDotOutputFilename != "" && b.Result.NfaDot != nil {
-		noError(os.WriteFile(p.NfaDotOutputFilename, b.Result.NfaDot, 0666), "write")
+func writeWithWriter(filepath string, writer func(io.Writer) error) error {
+	if filepath == "" {
+		return nil
 	}
-	if p.DfaDotOutputFilename != "" && b.Result.DfaDot != nil {
-		noError(os.WriteFile(p.DfaDotOutputFilename, b.Result.DfaDot, 0666), "write")
+	f, err := os.Create(filepath)
+	if err != nil {
+		return fmt.Errorf("write NFA: %w", err)
 	}
-	if p.OutputFilename == "" || b.Result.Lexer == nil {
-		return
-	}
-
-	noError(os.WriteFile(p.OutputFilename, b.Result.Lexer, 0666), "write")
-
-	if p.RunProgram {
-		c := exec.Command("go", "run", p.OutputFilename)
-		c.Stdin, c.Stdout, c.Stderr = p.Stdin, p.Stdout, p.Stderr
-		noError(c.Run(), "go run")
-	}
+	defer closeFile(f)
+	return writer(f)
 }

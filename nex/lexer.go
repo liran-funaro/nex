@@ -84,7 +84,7 @@ func (yylex *Lexer) Column() int {
 	return yylex.stack[len(yylex.stack)-1].column
 }
 
-type asserts uint64
+type asserts = uint64
 
 const (
 	aStartText asserts = 1 << iota

@@ -1,10 +1,15 @@
-package nex
+package graph
 
 import (
 	"fmt"
 	"regexp/syntax"
 	"slices"
 )
+
+type Expression interface {
+	GetRegex() string
+	GetId() int
+}
 
 // BuildNfa Regex -> NFA (Nondeterministic Finite Automaton)
 // We cannot have our alphabet be all Unicode characters. Instead,
@@ -23,21 +28,26 @@ import (
 //
 // e.g. the alphabet of /[0-9]*[Ee][2-5]*/ is singles: { E, e },
 // lim: { [0-1], [2-5], [6-9] } and the wild element.
-func BuildNfa(root *rule) (*node, error) {
+func BuildNfa[E Expression](expressions []E) ([]*Node, error) {
 	b := nfaBuilder{}
 	rootNode := b.newNode()
 
-	for _, x := range root.kid {
-		r, err := syntax.Parse(x.regex, syntax.Perl)
+	for _, x := range expressions {
+		r, err := syntax.Parse(x.GetRegex(), syntax.Perl)
 		if err != nil {
 			return nil, err
 		}
-		sNfa := b.build(r)
-		sNfa.end.accept = x.id
+		sNfa, err := b.build(r)
+		if err != nil {
+			return nil, err
+		}
+		sNfa.end.Accept = x.GetId()
 		newNilEdge(rootNode, sNfa.start)
 	}
 
-	return rootNode, nil
+	// Compute shortlist of nodes (reachable nodes), as we may have discarded
+	// nodes left over from parsing. Also, make `nfaRoot` the start node.
+	return compactGraph(rootNode), nil
 }
 
 type nfaBuilder struct {
@@ -45,7 +55,7 @@ type nfaBuilder struct {
 }
 
 type subNfa struct {
-	start, end *node
+	start, end *Node
 }
 
 func (b *nfaBuilder) newSubNfa() subNfa {
@@ -61,14 +71,14 @@ func sortedAlphabet(singles map[rune]any) []rune {
 	return runes
 }
 
-func (b *nfaBuilder) build(r *syntax.Regexp) subNfa {
+func (b *nfaBuilder) build(r *syntax.Regexp) (subNfa, error) {
 	switch r.Op {
 	case syntax.OpNoMatch: // matches no strings
-		panic("OpNoMatch is not implemented")
+		return subNfa{}, fmt.Errorf("OpNoMatch is not implemented")
 	case syntax.OpEmptyMatch: // matches empty string
 		nfa := b.newSubNfa()
 		newNilEdge(nfa.start, nfa.end)
-		return nfa
+		return nfa, nil
 	case syntax.OpLiteral: // matches Runes sequence
 		start := b.newNode()
 		curEnd := start
@@ -81,62 +91,74 @@ func (b *nfaBuilder) build(r *syntax.Regexp) subNfa {
 			}
 			curEnd = n
 		}
-		return subNfa{start, curEnd}
+		return subNfa{start, curEnd}, nil
 	case syntax.OpCharClass: // matches Runes interpreted as range pair list
 		nfa := b.newSubNfa()
 		newClassEdge(nfa.start, nfa.end, r.Rune)
-		return nfa
+		return nfa, nil
 	case syntax.OpAnyCharNotNL: // matches any character except newline
 		fallthrough
 	case syntax.OpAnyChar: // matches any character
 		nfa := b.newSubNfa()
 		newWildEdge(nfa.start, nfa.end)
-		return nfa
+		return nfa, nil
 	case syntax.OpBeginLine: // matches empty string at beginning of line
 		nfa := b.newSubNfa()
-		newAssertEdge(nfa.start, nfa.end, aStartLine)
-		return nfa
+		newAssertEdge(nfa.start, nfa.end, AStartLine)
+		return nfa, nil
 	case syntax.OpEndLine: // matches empty string at end of line
 		nfa := b.newSubNfa()
-		newAssertEdge(nfa.start, nfa.end, aEndLine)
-		return nfa
+		newAssertEdge(nfa.start, nfa.end, AEndLine)
+		return nfa, nil
 	case syntax.OpBeginText: // matches empty string at beginning of text
 		nfa := b.newSubNfa()
-		newAssertEdge(nfa.start, nfa.end, aStartText)
-		return nfa
+		newAssertEdge(nfa.start, nfa.end, AStartText)
+		return nfa, nil
 	case syntax.OpEndText: // matches empty string at end of text
 		nfa := b.newSubNfa()
-		newAssertEdge(nfa.start, nfa.end, aEndText)
-		return nfa
+		newAssertEdge(nfa.start, nfa.end, AEndText)
+		return nfa, nil
 	case syntax.OpWordBoundary: // matches word boundary `\b`
 		nfa := b.newSubNfa()
-		newAssertEdge(nfa.start, nfa.end, aWordBoundary)
-		return nfa
+		newAssertEdge(nfa.start, nfa.end, AWordBoundary)
+		return nfa, nil
 	case syntax.OpNoWordBoundary: // matches word non-boundary `\B`
 		nfa := b.newSubNfa()
-		newAssertEdge(nfa.start, nfa.end, aNoWordBoundary)
-		return nfa
+		newAssertEdge(nfa.start, nfa.end, ANoWordBoundary)
+		return nfa, nil
 	case syntax.OpCapture: // capturing subexpression with index Cap, optional name Name
 		return b.build(r.Sub[0])
 	case syntax.OpPlus: // matches Sub[0] one or more times
-		nfa := b.build(r.Sub[0])
+		nfa, err := b.build(r.Sub[0])
+		if err != nil {
+			return subNfa{}, err
+		}
 		newNilEdge(nfa.end, nfa.start)
-		return nfa
+		return nfa, nil
 	case syntax.OpStar: // matches Sub[0] zero or more times
-		nfa := b.build(r.Sub[0])
+		nfa, err := b.build(r.Sub[0])
+		if err != nil {
+			return subNfa{}, err
+		}
 		newNilEdge(nfa.end, nfa.start)
 		nfa.start = nfa.end
-		return nfa
+		return nfa, nil
 	case syntax.OpQuest: // matches Sub[0] zero or one times
-		nfa := b.build(r.Sub[0])
+		nfa, err := b.build(r.Sub[0])
+		if err != nil {
+			return subNfa{}, err
+		}
 		newNilEdge(nfa.start, nfa.end)
-		return nfa
+		return nfa, nil
 	case syntax.OpRepeat: // matches Sub[0] at least Min times, at most Max (Max == -1 is no limit)
 		nfa := b.newSubNfa()
 		lastNfa := &nfa
 		prevEnd := nfa.start
 		for i := 0; i < r.Min; i++ {
-			rNfa := b.build(r.Sub[0])
+			rNfa, err := b.build(r.Sub[0])
+			if err != nil {
+				return subNfa{}, err
+			}
 			newNilEdge(prevEnd, rNfa.start)
 			prevEnd = rNfa.end
 			lastNfa = &rNfa
@@ -144,32 +166,41 @@ func (b *nfaBuilder) build(r *syntax.Regexp) subNfa {
 		newNilEdge(prevEnd, nfa.end)
 		if r.Max < 0 {
 			newNilEdge(prevEnd, lastNfa.start)
-			return nfa
+			return nfa, nil
 		}
 		for i := 0; i < (r.Max - r.Min); i++ {
-			rNfa := b.build(r.Sub[0])
+			rNfa, err := b.build(r.Sub[0])
+			if err != nil {
+				return subNfa{}, err
+			}
 			newNilEdge(prevEnd, rNfa.start)
 			newNilEdge(rNfa.end, nfa.end)
 			prevEnd = rNfa.end
 		}
-		return nfa
+		return nfa, nil
 	case syntax.OpConcat: // matches concatenation of Subs
 		start := b.newNode()
 		curStart := start
 		for _, s := range r.Sub {
-			nfa := b.build(s)
+			nfa, err := b.build(s)
+			if err != nil {
+				return subNfa{}, err
+			}
 			newNilEdge(curStart, nfa.start)
 			curStart = nfa.end
 		}
-		return subNfa{start, curStart}
+		return subNfa{start, curStart}, nil
 	case syntax.OpAlternate: // matches alternation of Subs
 		nfa := b.newSubNfa()
 		for _, s := range r.Sub {
-			sNfa := b.build(s)
+			sNfa, err := b.build(s)
+			if err != nil {
+				return subNfa{}, err
+			}
 			newNilEdge(nfa.start, sNfa.start)
 			newNilEdge(sNfa.end, nfa.end)
 		}
-		return nfa
+		return nfa, nil
 	}
-	panic(fmt.Sprintf("Unreconized op: '%d'", r.Op))
+	return subNfa{}, fmt.Errorf("unreconized op: '%d'", r.Op)
 }
