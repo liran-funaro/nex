@@ -5,16 +5,12 @@ import (
 	"errors"
 	"fmt"
 	"io"
-	"log"
-	"os"
 	"strings"
 
 	"github.com/liran-funaro/nex/nex/graph"
 )
 
 const rootNodeId = 0
-
-var logger = log.New(os.Stderr, "[nex-parser] ", log.LstdFlags|log.Lshortfile)
 
 var (
 	ErrUnmatchedRBrace   = errors.New("unmatched '}'")
@@ -67,14 +63,16 @@ func (r *NexProgram) WriteDFADotGraph(writer io.Writer) error {
 func ParseNex(in io.Reader) (*NexProgram, error) {
 	p := parser{
 		in:               bufio.NewReader(in),
-		lineno:           1,
+		line:             1,
+		char:             1,
 		expectRootRAngle: false,
 	}
 	program := &NexProgram{}
-	if err := p.parse(program); err != nil {
-		return nil, err
-	}
+	p.parse(program)
 	program.Code = p.readRemaining()
+	if p.err != nil {
+		return nil, p.err
+	}
 	return program, genGraphs(program)
 }
 
@@ -103,147 +101,162 @@ func genGraphs(x *NexProgram) error {
 
 type parser struct {
 	in               *bufio.Reader
-	lineno           int
-	colno            int
+	line             int
+	col              int
+	char             int
 	r                rune
 	expectRootRAngle bool
 	err              error
+	eof              bool
 }
 
-// read returns true if reached EOF
+// read returns true if successful.
 func (b *parser) read() bool {
+	if b.err != nil || b.eof {
+		return false
+	}
+
 	var err error
 	b.r, _, err = b.in.ReadRune()
-	if err == io.EOF {
-		return true
-	}
-	b.err = err
 	if err != nil {
-		logger.Fatal(err)
-	}
-	if b.r == '\n' {
-		b.lineno++
-		b.colno = 0
-	} else {
-		b.colno++
-	}
-	return false
-}
-
-// skipWs returns true if reached EOF
-func (b *parser) skipWs() bool {
-	for !b.read() {
-		if strings.IndexRune(" \n\t\r", b.r) == -1 {
-			return false
+		if errors.Is(err, io.EOF) {
+			b.eof = true
+		} else {
+			b.err = err
 		}
+		return false
+	}
+
+	b.char++
+	if b.r == '\n' {
+		b.line++
+		b.col = 0
+	} else {
+		b.col++
 	}
 	return true
 }
 
+// readNextNonWs returns true if successful.
+func (b *parser) readNextNonWs() bool {
+	for b.read() {
+		if strings.IndexRune(" \n\t\r", b.r) == -1 {
+			return true
+		}
+	}
+	return false
+}
+
 func (b *parser) readRemaining() string {
 	var buf []rune
-	for done := b.skipWs(); !done; done = b.read() {
+	for ok := b.readNextNonWs(); ok; ok = b.read() {
 		buf = append(buf, b.r)
 	}
 	return string(buf)
+}
+
+func (b *parser) reportError(err error) {
+	// We only report the first error.
+	if b.err != nil {
+		return
+	}
+	b.err = fmt.Errorf("%d:%d: %w", b.line, b.col, err)
 }
 
 func (b *parser) readCode() string {
 	nesting := 0
 	var buf []rune
-	for {
-		if b.r == '\n' && nesting == 0 {
-			break
-		}
+	for ok := true; ok && (b.r != '\n' || nesting > 0); ok = b.read() {
 		buf = append(buf, b.r)
-		if '{' == b.r {
+		switch b.r {
+		case '{':
 			nesting++
-		} else if '}' == b.r {
+		case '}':
 			nesting--
 			if nesting < 0 {
-				logger.Fatal(fmt.Errorf("%d:%d: %w", b.lineno, b.colno, ErrUnmatchedRBrace))
+				b.reportError(ErrUnmatchedRBrace)
+				return ""
 			}
 		}
+	}
 
-		if b.read() {
-			if nesting > 0 {
-				logger.Fatal(fmt.Errorf("%d:%d: %w", b.lineno, b.colno, ErrUnmatchedLBrace))
-			} else {
-				break
-			}
-		}
+	if nesting > 0 {
+		b.reportError(ErrUnmatchedLBrace)
 	}
 	return string(buf)
 }
 
-func (b *parser) readRegex() (string, error) {
+func (b *parser) readRegex() string {
 	delim := b.r
-	if b.read() {
-		return "", ErrUnexpectedEOF
-	}
 	var regex []rune
-	for b.r != delim || (len(regex) > 0 && regex[len(regex)-1] == '\\') {
-		if '\n' == b.r {
-			return "", ErrUnexpectedNewline
-		}
+	isEscape := false
+	for ok := b.read(); ok && '\n' != b.r && (b.r != delim || isEscape); ok = b.read() {
+		isEscape = '\\' == b.r
 		regex = append(regex, b.r)
-		if b.read() {
-			return "", ErrUnexpectedEOF
-		}
 	}
 
-	return string(regex), nil
+	if b.err != nil {
+		return ""
+	} else if b.eof {
+		b.reportError(ErrUnexpectedEOF)
+		return ""
+	} else if '\n' == b.r {
+		b.reportError(ErrUnexpectedNewline)
+		return ""
+	}
+	return string(regex)
 }
 
-func (b *parser) parse(node *NexProgram) error {
-	for !b.skipWs() {
+func (b *parser) parse(node *NexProgram) {
+	for b.readNextNonWs() {
 		if '<' == b.r {
 			if node.Id != rootNodeId || len(node.Children) > 0 {
-				return ErrUnexpectedLAngle
+				b.reportError(ErrUnexpectedLAngle)
+				return
 			}
-			if b.skipWs() {
-				return ErrUnexpectedEOF
+			if !b.readNextNonWs() {
+				b.reportError(ErrUnexpectedEOF)
+				return
 			}
 			node.StartCode = b.readCode()
 			b.expectRootRAngle = true
 			continue
 		} else if '>' == b.r {
 			if node.Id == rootNodeId && !b.expectRootRAngle {
-				return ErrUnmatchedRAngle
+				b.reportError(ErrUnmatchedRAngle)
+				return
 			}
-			if b.skipWs() {
-				return ErrUnexpectedEOF
+			if !b.readNextNonWs() {
+				b.reportError(ErrUnexpectedEOF)
+				return
 			}
 			node.EndCode = b.readCode()
-			return nil
+			return
 		}
 
-		regex, err := b.readRegex()
-		if err != nil {
-			return err
-		}
+		regex := b.readRegex()
 		if "" == regex {
-			return nil
+			return
 		}
 
-		child := &NexProgram{Id: b.lineno, Regex: regex}
+		child := &NexProgram{Id: b.line, Regex: regex}
 		node.Children = append(node.Children, child)
 
-		if b.skipWs() {
-			return ErrUnexpectedEOF
+		if !b.readNextNonWs() {
+			b.reportError(ErrUnexpectedEOF)
+			return
 		}
 		if '<' == b.r {
-			if b.skipWs() {
-				return ErrUnexpectedEOF
+			if !b.readNextNonWs() {
+				b.reportError(ErrUnexpectedEOF)
+				return
 			}
 			child.StartCode = b.readCode()
-			if err := b.parse(child); err != nil {
-				return fmt.Errorf("sub-parse: %w", err)
-			}
+			b.parse(child)
 		} else {
 			child.Code = b.readCode()
 		}
 	}
 
-	return ErrUnexpectedEOF
+	b.reportError(ErrUnexpectedEOF)
 }

@@ -259,6 +259,15 @@ a a . a .
 . . c c
 d d d d
 e e . .`,
+		}, {
+			"Delim and escape",
+			`
+/a\// { *lval += "0" }
+_b\__  { *lval += "1" }
+"\s+" { *lval += yylex.Text() }
+'.'   { *lval += "." }
+`,
+			"a/ a\\ aa b_ b\\ bb c", "0 .. .. 1 .. .. .",
 		},
 	} {
 		t.Run(fmt.Sprintf("[%d] %s", i, x.name), func(t *testing.T) {
