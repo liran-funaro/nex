@@ -1,4 +1,4 @@
-package nex
+package exec
 
 import (
 	"flag"
@@ -9,10 +9,11 @@ import (
 	"path"
 	"strings"
 
-	"github.com/liran-funaro/nex/nex/parser"
+	"github.com/liran-funaro/nex/parser"
+	"github.com/liran-funaro/nex/writer"
 )
 
-type ExecParams struct {
+type Params struct {
 	Standalone           bool
 	CustomError          bool
 	CustomPrefix         string
@@ -26,9 +27,9 @@ type ExecParams struct {
 	Stderr               io.Writer
 }
 
-func ParseExecParams(name string, args ...string) (*ExecParams, error) {
+func ParseParams(name string, args ...string) (*Params, error) {
 	f := flag.NewFlagSet(name, flag.ExitOnError)
-	p := &ExecParams{
+	p := &Params{
 		Stdin:  os.Stdin,
 		Stdout: os.Stdout,
 		Stderr: os.Stderr,
@@ -53,15 +54,15 @@ func ParseExecParams(name string, args ...string) (*ExecParams, error) {
 	return p, nil
 }
 
-func Exec(name string, args ...string) error {
-	p, err := ParseExecParams(name, args...)
+func Execute(name string, args ...string) error {
+	p, err := ParseParams(name, args...)
 	if err != nil {
 		return fmt.Errorf("parse-params: %w", err)
 	}
-	return ExecWithParams(p)
+	return ExecuteWithParams(p)
 }
 
-func ExecWithParams(p *ExecParams) error {
+func ExecuteWithParams(p *Params) error {
 	var err error
 	program, err := p.parseNex()
 	if err != nil {
@@ -93,7 +94,7 @@ func ExecWithParams(p *ExecParams) error {
 		return nil
 	}
 
-	b := &LexerBuilder{
+	b := &writer.LexerBuilder{
 		CustomPrefix: p.CustomPrefix,
 		Standalone:   p.Standalone,
 		CustomError:  p.CustomError,
@@ -126,7 +127,7 @@ func closeFile(f *os.File) {
 	_ = f.Close()
 }
 
-func (p *ExecParams) parseNex() (*parser.NexProgram, error) {
+func (p *Params) parseNex() (*parser.NexProgram, error) {
 	infile := os.Stdin
 	var err error
 	if p.InputFilename != "" {
@@ -150,7 +151,7 @@ func writeWithWriter(filepath string, writer func(io.Writer) error) error {
 	}
 	f, err := os.Create(filepath)
 	if err != nil {
-		return fmt.Errorf("write NFA: %w", err)
+		return fmt.Errorf("write graph: %w", err)
 	}
 	defer closeFile(f)
 	return writer(f)

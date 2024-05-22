@@ -12,8 +12,9 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/liran-funaro/nex/nex"
-	"github.com/liran-funaro/nex/nex/parser"
+	exec2 "github.com/liran-funaro/nex/exec"
+	"github.com/liran-funaro/nex/parser"
+	"github.com/liran-funaro/nex/writer"
 	"github.com/stretchr/testify/require"
 )
 
@@ -37,7 +38,9 @@ var peterOutput string
 
 func TestNexPrograms(t *testing.T) {
 	t.Parallel()
-	for _, x := range []struct {
+	outputDir := makeOutputDir(t, "nex-programs")
+
+	for i, x := range []struct {
 		prog, in, out string
 	}{
 		{"lc.nex", "no newline", "0 10\n"},
@@ -60,13 +63,14 @@ func TestNexPrograms(t *testing.T) {
 		t.Run(x.prog, func(t *testing.T) {
 			t.Parallel()
 			var stdout bytes.Buffer
-			require.NoError(t, nex.ExecWithParams(&nex.ExecParams{
-				InputFilename: path.Join("test-data", x.prog),
-				Standalone:    true,
-				RunProgram:    true,
-				Stdin:         strings.NewReader(x.in),
-				Stderr:        os.Stderr,
-				Stdout:        &stdout,
+			require.NoError(t, exec2.ExecuteWithParams(&exec2.Params{
+				InputFilename:  path.Join("test-data", x.prog),
+				OutputFilename: makeProgramFile(t, outputDir, i, x.prog),
+				Standalone:     true,
+				RunProgram:     true,
+				Stdin:          strings.NewReader(x.in),
+				Stderr:         os.Stderr,
+				Stdout:         &stdout,
 			}))
 			require.Equal(t, x.out, string(stdout.Bytes()))
 		})
@@ -89,10 +93,7 @@ func main() {
 
 func TestCornerCases(t *testing.T) {
 	t.Parallel()
-	//tmpdir := t.TempDir()
-	tmpdir, err := filepath.Abs("./test-data/output")
-	require.NoError(t, err)
-	require.NoError(t, os.MkdirAll(tmpdir, os.ModePerm))
+	outputDir := makeOutputDir(t, "corner-cases")
 
 	for i, x := range []struct {
 		name, prog, in, out string
@@ -274,14 +275,12 @@ _b\__  { *lval += "1" }
 			t.Parallel()
 			program, err := parser.ParseNex(strings.NewReader(x.prog + cornerCasesMainDoc))
 			require.NoError(t, err)
-			b := nex.LexerBuilder{}
+			b := writer.LexerBuilder{}
 			code, err := b.DumpFormattedLexer(program)
 			require.NoError(t, err)
-			progDir := path.Join(tmpdir, fmt.Sprintf("prog-%d", i))
-			require.NoError(t, os.MkdirAll(progDir, os.ModePerm))
-			outPath := path.Join(progDir, "main.go")
+			outPath := makeProgramFile(t, outputDir, i, "prog")
 			require.NoError(t, os.WriteFile(outPath, code, os.ModePerm))
-			testProgram(t, tmpdir, x.in, x.out, outPath)
+			testProgram(t, outputDir, x.in, x.out, outPath)
 		})
 	}
 }
@@ -353,23 +352,41 @@ func testProgram(t *testing.T, cwd, input, output string, goFiles ...string) {
 }
 
 func testWithYacc(t *testing.T, srcDir, nexFile, yFile string, otherFiles []string, fields, input, output string) {
-	cwd := t.TempDir()
+	outputDir := makeOutputDir(t, "yacc", nexFile)
 	for _, f := range append(otherFiles, nexFile, yFile) {
-		copyToDir(t, cwd, path.Join(srcDir, f))
+		copyToDir(t, outputDir, path.Join(srcDir, f))
 	}
 
-	nexFile = path.Join(cwd, nexFile)
+	nexFile = path.Join(outputDir, nexFile)
 	nexOutFile := nexFile + ".go"
-	require.NoError(t, nex.Exec("nex", "-o", nexOutFile, nexFile))
+	require.NoError(t, exec2.Execute("nex", "-o", nexOutFile, nexFile))
 	replaceInFile(t, nexOutFile, "// [NEX_END_OF_LEXER_STRUCT]", fields)
 
-	yFile = path.Join(cwd, yFile)
+	yFile = path.Join(outputDir, yFile)
 	yOutFile := yFile + ".go"
-	runCmd(t, cwd, "goyacc", "-o", yOutFile, yFile)
+	runCmd(t, outputDir, "goyacc", "-o", yOutFile, yFile)
 
 	goFiles := []string{nexOutFile, yOutFile}
 	for _, f := range otherFiles {
-		goFiles = append(goFiles, path.Join(cwd, f))
+		goFiles = append(goFiles, path.Join(outputDir, f))
 	}
-	testProgram(t, cwd, input, output, goFiles...)
+	testProgram(t, outputDir, input, output, goFiles...)
+}
+
+func makeOutputDir(t *testing.T, name ...string) string {
+	outputDir := os.Getenv("NEX_TEST_DEBUG_OUTPUT")
+	if outputDir == "" {
+		outputDir = t.TempDir()
+	}
+	outputDir, err := filepath.Abs(outputDir)
+	require.NoError(t, err)
+	outputDir = filepath.Join(append([]string{outputDir}, name...)...)
+	require.NoError(t, os.MkdirAll(outputDir, os.ModePerm))
+	return outputDir
+}
+
+func makeProgramFile(t *testing.T, outputDir string, progIndex int, name string) string {
+	progDir := path.Join(outputDir, fmt.Sprintf("%d-%s", progIndex, name))
+	require.NoError(t, os.MkdirAll(progDir, os.ModePerm))
+	return path.Join(progDir, "main.go")
 }

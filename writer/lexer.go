@@ -1,4 +1,4 @@
-package nex
+package writer
 
 // [PREAMBLE PLACEHOLDER]
 import (

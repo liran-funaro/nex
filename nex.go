@@ -4,11 +4,11 @@ import (
 	"log"
 	"os"
 
-	"github.com/liran-funaro/nex/nex"
+	"github.com/liran-funaro/nex/exec"
 )
 
 func main() {
-	if err := nex.Exec(os.Args[0], os.Args[1:]...); err != nil {
+	if err := exec.Execute(os.Args[0], os.Args[1:]...); err != nil {
 		log.Fatal(err)
 	}
 }
