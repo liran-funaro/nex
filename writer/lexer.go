@@ -9,16 +9,11 @@ import (
 )
 
 type Lexer struct {
-	// The lexer runs in its own goroutine, and communicates via channel 'ch'.
-	ch     chan frame
-	cancel context.CancelFunc
-
-	// We record the level of nesting because the action could return, and a
-	// subsequent call expects to pick up where it left off. In other words,
-	// we're simulating a coroutine.
-	// TODO: Support a channel-based variant that compatible with Go's yacc.
-	stack []frame
-	stale bool
+	// The lexer runs in a goroutine, and communicates via a channel.
+	ch       chan *frame
+	ctx      context.Context
+	cancel   context.CancelFunc
+	curFrame *frame
 
 	parseResult any
 	parseError  error
@@ -29,6 +24,8 @@ type Lexer struct {
 }
 
 // NewLexer creates a new lexer without init.
+//
+//goland:noinspection GoUnusedExportedFunction
 func NewLexer(in io.Reader) *Lexer {
 	return NewLexerWithInit(in, nil)
 }
@@ -38,50 +35,112 @@ func NewLexer(in io.Reader) *Lexer {
 func NewLexerWithInit(in io.Reader, initFun func(*Lexer)) *Lexer {
 	ctx, cancel := context.WithCancel(context.Background())
 	yylex := &Lexer{
-		ch:     make(chan frame),
+		ch:     make(chan *frame),
+		ctx:    ctx,
 		cancel: cancel,
 	}
 	if initFun != nil {
 		initFun(yylex)
 	}
-	s := scanner{
-		dfa: &programDfa,
-		in:  bufio.NewReader(in),
-		ch:  yylex.ch,
-		ctx: ctx,
-	}
-	go s.scan()
+	go yylex.scanRoot(in)
 	return yylex
 }
 
+// Stop cancels the background scanner.
 func (yylex *Lexer) Stop() {
 	yylex.cancel()
 }
 
 // Text returns the matched text.
 func (yylex *Lexer) Text() string {
-	if len(yylex.stack) == 0 {
+	if yylex.curFrame == nil {
 		return ""
 	}
-	return string(yylex.stack[len(yylex.stack)-1].text)
+	return string(yylex.curFrame.text)
 }
 
 // Line returns the current line number.
 // The first line is 0.
 func (yylex *Lexer) Line() int {
-	if len(yylex.stack) == 0 {
+	if yylex.curFrame == nil {
 		return 0
 	}
-	return yylex.stack[len(yylex.stack)-1].line
+	return yylex.curFrame.line
 }
 
 // Column returns the current column number.
 // The first column is 0.
 func (yylex *Lexer) Column() int {
-	if len(yylex.stack) == 0 {
+	if yylex.curFrame == nil {
 		return 0
 	}
-	return yylex.stack[len(yylex.stack)-1].column
+	return yylex.curFrame.column
+}
+
+func (yylex *Lexer) appendFrame(kind frameKind, state int, text []rune, line int, column int) {
+	select {
+	case <-yylex.ctx.Done():
+	case yylex.ch <- &frame{frameKey{kind, state}, text, line, column}:
+	}
+}
+
+func (yylex *Lexer) scanRoot(in io.Reader) {
+	defer close(yylex.ch)
+	yylex.appendFrame(kStartCode, 0, nil, 0, 0)
+	yylex.scan(&scanner{dfa: &programDfa, in: bufio.NewReader(in)})
+	yylex.appendFrame(kEndCode, 0, nil, 0, 0)
+}
+
+func (yylex *Lexer) scan(s *scanner) {
+	if s == nil {
+		return
+	}
+
+	for yylex.ctx.Err() == nil {
+		// The DFA starts at state 0.
+		st := 0
+		s.matchPos = -1
+		s.matchAccept = -1
+
+		madeProgress := true
+		for madeProgress && st >= 0 {
+			madeProgress = false
+			if curState := &s.dfa.states[st]; curState.assertStep != nil {
+				if a := s.consumeAsserts(curState.assertMask); a != 0 {
+					st = curState.assertStep(a)
+					s.checkAccept(st)
+					madeProgress = true
+				}
+			}
+
+			if st < 0 {
+				break
+			}
+
+			if curState := &s.dfa.states[st]; curState.runeStep != nil {
+				if r, ok := s.consumeRune(); ok {
+					st = curState.runeStep(r)
+					s.checkAccept(st)
+					madeProgress = true
+				}
+			}
+		}
+
+		// DFA is stuck. Return last match if it exists, otherwise advance by one rune and restart.
+		if s.matchPos < s.minCapture {
+			if len(s.runes) == 0 {
+				// This can only happen at the end of input.
+				return
+			}
+			s.resetBuffer(1)
+		} else {
+			text := s.runes[:s.matchPos]
+			yylex.appendFrame(kStartCode, s.matchAccept, text, s.line, s.column)
+			yylex.scan(s.getNest(s.matchAccept, text))
+			yylex.appendFrame(kEndCode, s.matchAccept, text, s.line, s.column)
+			s.resetBuffer(s.matchPos)
+		}
+	}
 }
 
 type asserts = uint64
@@ -95,8 +154,20 @@ const (
 	aNoWordBoundary
 )
 
+type frameKind int
+
+const (
+	kStartCode frameKind = iota
+	kEndCode
+)
+
+type frameKey struct {
+	kind  frameKind
+	state int
+}
+
 type frame struct {
-	state        int
+	key          frameKey
 	text         []rune
 	line, column int
 }
@@ -115,8 +186,6 @@ type dfa struct {
 
 type scanner struct {
 	dfa *dfa
-	ch  chan frame
-	ctx context.Context
 
 	// in should be nil when EOF is reached
 	in *bufio.Reader
@@ -226,6 +295,13 @@ func (s *scanner) checkAccept(st int) {
 }
 
 func (s *scanner) resetBuffer(i int) {
+	// We make sure to consume enough runes to discard them.
+	// We load one additional rune before shifting the buffers
+	// because we need both the previous and next runes to correctly
+	// calculate the next assert.
+	for ok := true; ok && s.pos <= i; _, ok = s.consumeRune() {
+	}
+
 	for _, r := range s.runes[:i] {
 		if r == '\n' {
 			s.line++
@@ -234,10 +310,6 @@ func (s *scanner) resetBuffer(i int) {
 			s.column++
 		}
 	}
-
-	// We load the next rune and asserts before shifting the buffers
-	// to avoid identifying the next rune as the beginning of the text.
-	s.loadNext()
 
 	s.runes = s.runes[i:]
 	s.asserts = s.asserts[i:]
@@ -263,101 +335,27 @@ func (s *scanner) attemptMapFunc(st int, f map[int]int) int {
 	return st
 }
 
-func (s *scanner) getNest(st int) (*dfa, bool) {
+func (s *scanner) getNest(st int, text []rune) *scanner {
 	if s.dfa.nest == nil {
-		return nil, false
+		return nil
 	}
 	nestedDfa, ok := s.dfa.nest[st]
-	return &nestedDfa, ok
-}
-
-func (s *scanner) appendFrame(state int, text []rune) {
-	select {
-	case s.ch <- frame{state, text, s.line, s.column}:
-	case <-s.ctx.Done():
+	if !ok {
+		return nil
 	}
-}
-
-func (s *scanner) scan() {
-	for s.ctx.Err() == nil {
-		// The DFA starts at state 0.
-		st := 0
-		s.matchPos = -1
-		s.matchAccept = -1
-
-		madeProgress := true
-		for madeProgress && st >= 0 {
-			madeProgress = false
-			if curState := &s.dfa.states[st]; curState.assertStep != nil {
-				if a := s.consumeAsserts(curState.assertMask); a != 0 {
-					st = curState.assertStep(a)
-					s.checkAccept(st)
-					madeProgress = true
-				}
-			}
-
-			if curState := &s.dfa.states[st]; curState.runeStep != nil {
-				if r, ok := s.consumeRune(); ok {
-					st = curState.runeStep(r)
-					s.checkAccept(st)
-					madeProgress = true
-				}
-			}
-		}
-
-		// All DFAs stuck. Return last match if it exists, otherwise advance by one rune and restart.
-		if s.matchPos < s.minCapture {
-			if len(s.runes) == 0 { // This can only happen at the end of input.
-				break
-			}
-			s.resetBuffer(1)
-			continue
-		}
-
-		text := s.runes[:s.matchPos]
-		s.appendFrame(s.matchAccept, text)
-		if nestedDfa, ok := s.getNest(s.matchAccept); ok {
-			ns := scanner{
-				dfa:    nestedDfa,
-				runes:  text,
-				line:   s.line,
-				column: s.column,
-				ch:     s.ch,
-				ctx:    s.ctx,
-			}
-			ns.scan()
-		}
-		s.resetBuffer(s.matchPos)
+	return &scanner{
+		dfa:    &nestedDfa,
+		runes:  text,
+		line:   s.line,
+		column: s.column,
 	}
-	s.appendFrame(-1, nil)
-}
-
-func (yylex *Lexer) next(lvl int) int {
-	if lvl == len(yylex.stack) {
-		l, c := 0, 0
-		if lvl > 0 {
-			l, c = yylex.stack[lvl-1].line, yylex.stack[lvl-1].column
-		}
-		yylex.stack = append(yylex.stack, frame{0, nil, l, c})
-	}
-	if lvl == len(yylex.stack)-1 {
-		yylex.stack[lvl] = <-yylex.ch
-		yylex.stale = false
-	} else {
-		yylex.stale = true
-	}
-	return yylex.stack[lvl].state
-}
-
-func (yylex *Lexer) pop() {
-	yylex.stack = yylex.stack[:len(yylex.stack)-1]
 }
 
 // [LEX METHOD PLACEHOLDER]
 
 // Lex runs the lexer.
-// When the -s option is given, this function is not generated;
-// instead, the NN_FUN macro runs the lexer.
+//
+//goland:noinspection GoUnusedParameter
 func (yylex *Lexer) Lex(lval *yySymType) int {
 	// [LEX IMPLEMENTATION PLACEHOLDER]
 	return 0
@@ -365,8 +363,9 @@ func (yylex *Lexer) Lex(lval *yySymType) int {
 
 // [ERROR METHOD PLACEHOLDER]
 
+// Error is used to report an error to the lexer.
 func (yylex *Lexer) Error(e string) {
-	yylex.parseError = fmt.Errorf(fmt.Sprintf("%d:%d %s", yylex.Line(), yylex.Column(), e))
+	yylex.parseError = fmt.Errorf("%d:%d %s", yylex.Line(), yylex.Column(), e)
 }
 
 // [SUFFIX PLACEHOLDER]

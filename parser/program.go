@@ -10,9 +10,9 @@ import (
 type NexProgram struct {
 	Id        int
 	Regex     string
-	Code      string
 	StartCode string
 	EndCode   string
+	UserCode  string
 	Children  []*NexProgram
 	NFA       []*graph.Node
 	DFA       []*graph.Node

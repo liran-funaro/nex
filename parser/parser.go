@@ -21,7 +21,7 @@ func ParseNex(in io.Reader) (*NexProgram, error) {
 	p := parser{
 		in:   bufio.NewReader(in),
 		line: 1,
-		char: 1,
+		char: 0,
 	}
 	program := p.parseRoot()
 	if p.err != nil {
@@ -213,7 +213,7 @@ func (p *parser) readRegex(delim rune) *NexProgram {
 	if p.err != nil {
 		return nil
 	}
-	return &NexProgram{Id: p.line, Regex: string(regex)}
+	return &NexProgram{Id: p.char, Regex: string(regex)}
 }
 
 func (p *parser) isNextSubExp() bool {
@@ -267,7 +267,7 @@ func (p *parser) parseRoot() *NexProgram {
 	} else {
 		node.Children = p.parseExpList(false)
 	}
-	node.Code = p.readRemaining()
+	node.UserCode = p.readRemaining()
 	return node
 }
 
@@ -298,6 +298,6 @@ func (p *parser) parseExp(child *NexProgram) {
 	if p.isNextSubExp() {
 		p.parseSubExp(child)
 	} else {
-		child.Code = p.readCode()
+		child.StartCode = p.readCode()
 	}
 }
