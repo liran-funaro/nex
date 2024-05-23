@@ -294,7 +294,7 @@ var rpOutput string
 // Test the reverse-Polish notation calculator rp.{nex,y}.
 func TestNexPlusYacc(t *testing.T) {
 	t.Parallel()
-	testWithYacc(t, "test-data", "rp.nex", "rp.y", nil, "", rpInput, rpOutput)
+	testWithYacc(t, "test-data", "rp.nex", "rp.y", nil, rpInput, rpOutput)
 }
 
 //go:embed test-data/tacky/input.txt
@@ -306,19 +306,12 @@ var testTackyOutput string
 func TestWax(t *testing.T) {
 	t.Parallel()
 	testWithYacc(t, path.Join("test-data", "tacky"), "tacky.nex", "tacky.y", []string{"tacky.go"},
-		"p *Tacky", testTackyInput, testTackyOutput)
+		testTackyInput, testTackyOutput)
 }
 
 // ################################################################################
 // # Helper functions
 // ################################################################################
-
-func replaceInFile(t *testing.T, filepath, old, new string) {
-	data, err := os.ReadFile(filepath)
-	require.NoError(t, err)
-	data = []byte(strings.Replace(string(data), old, new, 1))
-	require.NoError(t, os.WriteFile(filepath, data, 0o666))
-}
 
 func copyToDir(t *testing.T, dst, src string) {
 	dst = filepath.Join(dst, filepath.Base(src))
@@ -351,7 +344,7 @@ func testProgram(t *testing.T, cwd, input, output string, goFiles ...string) {
 	require.Equal(t, output, string(got))
 }
 
-func testWithYacc(t *testing.T, srcDir, nexFile, yFile string, otherFiles []string, fields, input, output string) {
+func testWithYacc(t *testing.T, srcDir, nexFile, yFile string, otherFiles []string, input, output string) {
 	outputDir := makeOutputDir(t, "yacc", nexFile)
 	for _, f := range append(otherFiles, nexFile, yFile) {
 		copyToDir(t, outputDir, path.Join(srcDir, f))
@@ -360,7 +353,6 @@ func testWithYacc(t *testing.T, srcDir, nexFile, yFile string, otherFiles []stri
 	nexFile = path.Join(outputDir, nexFile)
 	nexOutFile := nexFile + ".go"
 	require.NoError(t, exec2.Execute("nex", "-o", nexOutFile, nexFile))
-	replaceInFile(t, nexOutFile, "// [NEX_END_OF_LEXER_STRUCT]", fields)
 
 	yFile = path.Join(outputDir, yFile)
 	yOutFile := yFile + ".go"

@@ -8,14 +8,20 @@ import (
 )
 
 type NexProgram struct {
-	Id        int
-	Regex     string
-	StartCode string
-	EndCode   string
-	UserCode  string
-	Children  []*NexProgram
-	NFA       []*graph.Node
-	DFA       []*graph.Node
+	Id         int
+	Regex      string
+	StartCode  string
+	EndCode    string
+	UserCode   string
+	Children   []*NexProgram
+	NFA        []*graph.Node
+	DFA        []*graph.Node
+	Parameters []Parameter
+}
+
+type Parameter struct {
+	Key   string
+	Value string
 }
 
 func (r *NexProgram) GetRegex() string {

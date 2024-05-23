@@ -1,3 +1,5 @@
+%field p *Tacky
+
 /[ \t\n]/     { /* Skip spaces and tabs. */ }
 /\/\/[^\n]*/  { /* Comments. */ }
 /[0-9]+(\.[0-9]+)?%/     { lval.s = yylex.Text(); return FRAC }

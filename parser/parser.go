@@ -18,11 +18,7 @@ var (
 )
 
 func ParseNex(in io.Reader) (*NexProgram, error) {
-	p := parser{
-		in:   bufio.NewReader(in),
-		line: 1,
-		char: 0,
-	}
+	p := parser{in: bufio.NewReader(in)}
 	program := p.parseRoot()
 	if p.err != nil {
 		return nil, p.err
@@ -57,11 +53,11 @@ type parser struct {
 	in       *bufio.Reader
 	line     int
 	col      int
-	char     int
 	r        rune
 	err      error
 	eof      bool
 	isUnread bool
+	nextId   int
 }
 
 func (p *parser) reportError(err error) {
@@ -74,6 +70,12 @@ func (p *parser) reportError(err error) {
 		return
 	}
 	p.err = fmt.Errorf("%d:%d: %w", p.line, p.col, err)
+}
+
+func (p *parser) newProgram(regexp string) *NexProgram {
+	prog := &NexProgram{Id: p.nextId, Regex: regexp}
+	p.nextId++
+	return prog
 }
 
 // read returns true if successful.
@@ -98,7 +100,9 @@ func (p *parser) read() bool {
 		return false
 	}
 
-	p.char++
+	if p.line == 0 {
+		p.line = 1
+	}
 	if p.r == '\n' {
 		p.line++
 		p.col = 0
@@ -213,7 +217,7 @@ func (p *parser) readRegex(delim rune) *NexProgram {
 	if p.err != nil {
 		return nil
 	}
-	return &NexProgram{Id: p.char, Regex: string(regex)}
+	return p.newProgram(string(regex))
 }
 
 func (p *parser) isNextSubExp() bool {
@@ -227,15 +231,28 @@ func (p *parser) isNextSubExp() bool {
 	return isSubExp
 }
 
+func (p *parser) isNextParam() bool {
+	if !p.mustReadNextNonWs() {
+		return false
+	}
+	isParam := '%' == p.r && p.col == 1
+	if !isParam {
+		p.unread()
+	}
+	return isParam
+}
+
 /*
 Nex Program Grammar
 ===================
 
 ROOT:
-	(1) EXP-LIST
+	(1) PARAM-LIST
+		EXP-LIST
 		EMPTY-REGEXP
 		USER-CODE
-	(2) SUB-EXP
+	(2) PARAM-LIST
+		SUB-EXP
 		USER-CODE
 
 EXP:
@@ -258,10 +275,14 @@ CODE:
 	(1) one line of code
 	(2) { multi line code }
 
+PARAM-LIST:
+	% key CODE
+	...
 */
 
 func (p *parser) parseRoot() *NexProgram {
-	node := &NexProgram{}
+	node := p.newProgram("")
+	node.Parameters = p.parseParamList()
 	if p.isNextSubExp() {
 		p.parseSubExp(node)
 	} else {
@@ -269,6 +290,18 @@ func (p *parser) parseRoot() *NexProgram {
 	}
 	node.UserCode = p.readRemaining()
 	return node
+}
+
+func (p *parser) parseParamList() []Parameter {
+	var params []Parameter
+	for p.isNextParam() {
+		var key []rune
+		for ok := p.readNextNonWs(); ok && !isSpace(p.r); ok = p.read() {
+			key = append(key, p.r)
+		}
+		params = append(params, Parameter{string(trimSpaces(key)), p.readCode()})
+	}
+	return params
 }
 
 func (p *parser) parseSubExp(node *NexProgram) {

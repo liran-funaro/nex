@@ -18,9 +18,7 @@ type Lexer struct {
 	parseResult any
 	parseError  error
 
-	// The following line makes it easy for scripts to insert fields in the
-	// generated code.
-	// [NEX_END_OF_LEXER_STRUCT]
+	// [NEX END OF LEXER STRUCT]
 }
 
 // NewLexer creates a new lexer without init.
